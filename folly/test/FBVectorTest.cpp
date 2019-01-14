@@ -1,5 +1,5 @@
 /*
- * Copyright 2013 Facebook, Inc.
+ * Copyright 2011-present Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,89 +17,46 @@
 //
 // Author: andrei.alexandrescu@fb.com
 
-#include "folly/Traits.h"
-#include "folly/Random.h"
-#include "folly/FBString.h"
-#include "folly/FBVector.h"
+#include <folly/FBVector.h>
 
-#include <gflags/gflags.h>
-
-#include <gtest/gtest.h>
 #include <list>
+#include <map>
 #include <memory>
+
 #include <boost/random.hpp>
+
+#include <folly/FBString.h>
+#include <folly/Random.h>
+#include <folly/Traits.h>
+#include <folly/container/Foreach.h>
+#include <folly/portability/GTest.h>
+#include <folly/test/FBVectorTestUtil.h>
 
 using namespace std;
 using namespace folly;
+using namespace folly::test::detail;
 
-auto static const seed = randomNumberSeed();
-typedef boost::mt19937 RandomT;
-static RandomT rng(seed);
-static const size_t maxString = 100;
-static const bool avoidAliasing = true;
+using IntFBVector = fbvector<int>;
+using FBStringFBVector = fbvector<fbstring>;
 
-template <class Integral1, class Integral2>
-Integral2 random(Integral1 low, Integral2 up) {
-  boost::uniform_int<> range(low, up);
-  return range(rng);
-}
-
-template <class String>
-void randomString(String* toFill, unsigned int maxSize = 1000) {
-  assert(toFill);
-  toFill->resize(random(0, maxSize));
-  FOR_EACH (i, *toFill) {
-    *i = random('a', 'z');
-  }
-}
-
-template <class String, class Integral>
-void Num2String(String& str, Integral n) {
-  str.resize(10, '\0');
-  sprintf(&str[0], "%ul", 10);
-  str.resize(strlen(str.c_str()));
-}
-
-std::list<char> RandomList(unsigned int maxSize) {
-  std::list<char> lst(random(0u, maxSize));
-  std::list<char>::iterator i = lst.begin();
-  for (; i != lst.end(); ++i) {
-    *i = random('a', 'z');
-  }
-  return lst;
-}
-
-template<class T> T randomObject();
-
-template<> int randomObject<int>() {
-  return random(0, 1024);
-}
-
-template<> folly::fbstring randomObject<folly::fbstring>() {
-  folly::fbstring result;
-  randomString(&result);
-  return result;
-}
-
-////////////////////////////////////////////////////////////////////////////////
-// Tests begin here
-////////////////////////////////////////////////////////////////////////////////
+#define VECTOR IntFBVector
+#include <folly/test/FBVectorTests.cpp.h> // nolint
+#undef VECTOR
+#define VECTOR FBStringFBVector
+#include <folly/test/FBVectorTests.cpp.h> // nolint
+#undef VECTOR
 
 TEST(fbvector, clause_23_3_6_1_3_ambiguity) {
   fbvector<int> v(10, 20);
   EXPECT_EQ(v.size(), 10);
-  FOR_EACH (i, v) {
-    EXPECT_EQ(*i, 20);
-  }
+  FOR_EACH (i, v) { EXPECT_EQ(*i, 20); }
 }
 
 TEST(fbvector, clause_23_3_6_1_11_ambiguity) {
   fbvector<int> v;
   v.assign(10, 20);
   EXPECT_EQ(v.size(), 10);
-  FOR_EACH (i, v) {
-    EXPECT_EQ(*i, 20);
-  }
+  FOR_EACH (i, v) { EXPECT_EQ(*i, 20); }
 }
 
 TEST(fbvector, clause_23_3_6_2_6) {
@@ -115,16 +72,16 @@ TEST(fbvector, clause_23_3_6_2_6) {
 
 TEST(fbvector, clause_23_3_6_4_ambiguity) {
   fbvector<int> v;
-  fbvector<int>::const_iterator i = v.end();
-  v.insert(i, 10, 20);
+  fbvector<int>::const_iterator it = v.end();
+  v.insert(it, 10, 20);
   EXPECT_EQ(v.size(), 10);
-  FOR_EACH (i, v) {
-    EXPECT_EQ(*i, 20);
+  for (auto i : v) {
+    EXPECT_EQ(i, 20);
   }
 }
 
 TEST(fbvector, composition) {
-  fbvector< fbvector<double> > matrix(100, fbvector<double>(100));
+  fbvector<fbvector<double>> matrix(100, fbvector<double>(100));
 }
 
 TEST(fbvector, works_with_std_string) {
@@ -134,10 +91,12 @@ TEST(fbvector, works_with_std_string) {
 }
 
 namespace {
-class UserDefinedType { int whatevs_; };
-}
+class UserDefinedType {
+  int whatevs_;
+};
+} // namespace
 
-FOLLY_ASSUME_FBVECTOR_COMPATIBLE(UserDefinedType);
+FOLLY_ASSUME_FBVECTOR_COMPATIBLE(UserDefinedType)
 
 TEST(fbvector, works_with_user_defined_type) {
   fbvector<UserDefinedType> v(10);
@@ -172,20 +131,20 @@ TEST(fbvector, emplace) {
 }
 
 TEST(fbvector, initializer_lists) {
-  fbvector<int> vec = { 1, 2, 3 };
+  fbvector<int> vec = {1, 2, 3};
   EXPECT_EQ(vec.size(), 3);
   EXPECT_EQ(vec[0], 1);
   EXPECT_EQ(vec[1], 2);
   EXPECT_EQ(vec[2], 3);
 
-  vec = { 0, 0, 12, 16 };
+  vec = {0, 0, 12, 16};
   EXPECT_EQ(vec.size(), 4);
   EXPECT_EQ(vec[0], 0);
   EXPECT_EQ(vec[1], 0);
   EXPECT_EQ(vec[2], 12);
   EXPECT_EQ(vec[3], 16);
 
-  vec.insert(vec.begin() + 1, { 23, 23 });
+  vec.insert(vec.begin() + 1, {23, 23});
   EXPECT_EQ(vec.size(), 6);
   EXPECT_EQ(vec[0], 0);
   EXPECT_EQ(vec[1], 23);
@@ -196,14 +155,14 @@ TEST(fbvector, initializer_lists) {
 }
 
 TEST(fbvector, unique_ptr) {
-  fbvector<std::unique_ptr<int> > v(12);
+  fbvector<std::unique_ptr<int>> v(12);
   std::unique_ptr<int> p(new int(12));
   v.push_back(std::move(p));
   EXPECT_EQ(*v.back(), 12);
 
   v[0] = std::move(p);
   EXPECT_FALSE(v[0].get());
-  v[0].reset(new int(32));
+  v[0] = std::make_unique<int>(32);
   std::unique_ptr<int> somePtr;
   v.insert(v.begin(), std::move(somePtr));
   EXPECT_EQ(*v[1], 32);
@@ -224,29 +183,32 @@ TEST(FBVector, task858056) {
 }
 
 TEST(FBVector, move_iterator) {
-  fbvector<int> base = { 0, 1, 2 };
+  fbvector<int> base = {0, 1, 2};
 
   auto cp1 = base;
-  fbvector<int> fbvi1(std::make_move_iterator(cp1.begin()),
-                      std::make_move_iterator(cp1.end()));
+  fbvector<int> fbvi1(
+      std::make_move_iterator(cp1.begin()), std::make_move_iterator(cp1.end()));
   EXPECT_EQ(fbvi1, base);
 
   auto cp2 = base;
   fbvector<int> fbvi2;
-  fbvi2.assign(std::make_move_iterator(cp2.begin()),
-               std::make_move_iterator(cp2.end()));
+  fbvi2.assign(
+      std::make_move_iterator(cp2.begin()), std::make_move_iterator(cp2.end()));
   EXPECT_EQ(fbvi2, base);
 
   auto cp3 = base;
   fbvector<int> fbvi3;
-  fbvi3.insert(fbvi3.end(),
-               std::make_move_iterator(cp3.begin()),
-               std::make_move_iterator(cp3.end()));
+  fbvi3.insert(
+      fbvi3.end(),
+      std::make_move_iterator(cp3.begin()),
+      std::make_move_iterator(cp3.end()));
   EXPECT_EQ(fbvi3, base);
 }
 
 TEST(FBVector, reserve_consistency) {
-  struct S { int64_t a, b, c, d; };
+  struct S {
+    int64_t a, b, c, d;
+  };
 
   fbvector<S> fb1;
   for (size_t i = 0; i < 1000; ++i) {
@@ -256,8 +218,43 @@ TEST(FBVector, reserve_consistency) {
   }
 }
 
-int main(int argc, char** argv) {
-  testing::InitGoogleTest(&argc, argv);
-  google::ParseCommandLineFlags(&argc, &argv, true);
-  return RUN_ALL_TESTS();
+TEST(FBVector, vector_of_maps) {
+  fbvector<std::map<std::string, std::string>> v;
+
+  v.push_back(std::map<std::string, std::string>());
+  v.push_back(std::map<std::string, std::string>());
+
+  EXPECT_EQ(2, v.size());
+
+  v[1]["hello"] = "world";
+  EXPECT_EQ(0, v[0].size());
+  EXPECT_EQ(1, v[1].size());
+
+  v[0]["foo"] = "bar";
+  EXPECT_EQ(1, v[0].size());
+  EXPECT_EQ(1, v[1].size());
+}
+
+TEST(FBVector, shrink_to_fit_after_clear) {
+  fbvector<int> fb1;
+  fb1.push_back(42);
+  fb1.push_back(1337);
+  fb1.clear();
+  fb1.shrink_to_fit();
+  EXPECT_EQ(fb1.size(), 0);
+  EXPECT_EQ(fb1.capacity(), 0);
+}
+
+TEST(FBVector, zero_len) {
+  fbvector<int> fb1(0);
+  fbvector<int> fb2(0, 10);
+  fbvector<int> fb3(std::move(fb1));
+  fbvector<int> fb4;
+  fb4 = std::move(fb2);
+  fbvector<int> fb5 = fb3;
+  fbvector<int> fb6;
+  fb6 = fb4;
+  std::initializer_list<int> il = {};
+  fb6 = il;
+  fbvector<int> fb7(fb6.begin(), fb6.end());
 }

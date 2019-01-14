@@ -1,5 +1,5 @@
 /*
- * Copyright 2013 Facebook, Inc.
+ * Copyright 2013-present Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,8 +14,7 @@
  * limitations under the License.
  */
 
-#ifndef FOLLY_EXCEPTION_H_
-#define FOLLY_EXCEPTION_H_
+#pragma once
 
 #include <errno.h>
 
@@ -23,10 +22,10 @@
 #include <stdexcept>
 #include <system_error>
 
-#include "folly/Conv.h"
-#include "folly/FBString.h"
-#include "folly/Likely.h"
-#include "folly/Portability.h"
+#include <folly/Conv.h>
+#include <folly/FBString.h>
+#include <folly/Likely.h>
+#include <folly/Portability.h>
 
 namespace folly {
 
@@ -36,25 +35,45 @@ namespace folly {
 //
 // The *Explicit functions take an explicit value for errno.
 
-// Helper to throw std::system_error
-void throwSystemErrorExplicit(int err, const char*) FOLLY_NORETURN;
-inline void throwSystemErrorExplicit(int err, const char* msg) {
-  throw std::system_error(err, std::system_category(), msg);
+inline std::system_error makeSystemErrorExplicit(int err, const char* msg) {
+  // TODO: The C++ standard indicates that std::generic_category() should be
+  // used for POSIX errno codes.
+  //
+  // We should ideally change this to use std::generic_category() instead of
+  // std::system_category().  However, undertaking this change will require
+  // updating existing call sites that currently catch exceptions thrown by
+  // this code and currently expect std::system_category.
+  return std::system_error(err, std::system_category(), msg);
 }
 
 template <class... Args>
-void throwSystemErrorExplicit(int, Args&&... args) FOLLY_NORETURN;
-template <class... Args>
-void throwSystemErrorExplicit(int err, Args&&... args) {
-  throwSystemErrorExplicit(
+std::system_error makeSystemErrorExplicit(int err, Args&&... args) {
+  return makeSystemErrorExplicit(
       err, to<fbstring>(std::forward<Args>(args)...).c_str());
+}
+
+inline std::system_error makeSystemError(const char* msg) {
+  return makeSystemErrorExplicit(errno, msg);
+}
+
+template <class... Args>
+std::system_error makeSystemError(Args&&... args) {
+  return makeSystemErrorExplicit(errno, std::forward<Args>(args)...);
+}
+
+// Helper to throw std::system_error
+[[noreturn]] inline void throwSystemErrorExplicit(int err, const char* msg) {
+  throw_exception(makeSystemErrorExplicit(err, msg));
+}
+
+template <class... Args>
+[[noreturn]] void throwSystemErrorExplicit(int err, Args&&... args) {
+  throw_exception(makeSystemErrorExplicit(err, std::forward<Args>(args)...));
 }
 
 // Helper to throw std::system_error from errno and components of a string
 template <class... Args>
-void throwSystemError(Args&&... args) FOLLY_NORETURN;
-template <class... Args>
-void throwSystemError(Args&&... args) {
+[[noreturn]] void throwSystemError(Args&&... args) {
   throwSystemErrorExplicit(errno, std::forward<Args>(args)...);
 }
 
@@ -72,7 +91,7 @@ void checkPosixError(int err, Args&&... args) {
 template <class... Args>
 void checkKernelError(ssize_t ret, Args&&... args) {
   if (UNLIKELY(ret < 0)) {
-    throwSystemErrorExplicit(-ret, std::forward<Args>(args)...);
+    throwSystemErrorExplicit(int(-ret), std::forward<Args>(args)...);
   }
 }
 
@@ -109,7 +128,15 @@ void checkFopenErrorExplicit(FILE* fp, int savedErrno, Args&&... args) {
   }
 }
 
-}  // namespace folly
+/**
+ * If cond is not true, raise an exception of type E.  E must have a ctor that
+ * works with const char* (a description of the failure).
+ */
+#define CHECK_THROW(cond, E)                             \
+  do {                                                   \
+    if (!(cond)) {                                       \
+      folly::throw_exception<E>("Check failed: " #cond); \
+    }                                                    \
+  } while (0)
 
-#endif /* FOLLY_EXCEPTION_H_ */
-
+} // namespace folly

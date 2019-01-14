@@ -1,5 +1,5 @@
 /*
- * Copyright 2013 Facebook, Inc.
+ * Copyright 2012-present Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,16 +14,14 @@
  * limitations under the License.
  */
 
-#include "folly/CpuId.h"
+#include <folly/CpuId.h>
 
-#include <glog/logging.h>
-#include <gtest/gtest.h>
+#include <folly/portability/GTest.h>
 
 using namespace folly;
 
 TEST(CpuId, Simple) {
-  // All CPUs should support MMX
   CpuId id;
-  EXPECT_TRUE(id.mmx());
+  // All x64 CPUs should support MMX
+  EXPECT_EQ(kIsArchAmd64, id.mmx());
 }
-

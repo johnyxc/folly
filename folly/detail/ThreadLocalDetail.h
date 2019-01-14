@@ -1,5 +1,5 @@
 /*
- * Copyright 2013 Facebook, Inc.
+ * Copyright 2011-present Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,148 +14,332 @@
  * limitations under the License.
  */
 
-#ifndef FOLLY_DETAIL_THREADLOCALDETAIL_H_
-#define FOLLY_DETAIL_THREADLOCALDETAIL_H_
+#pragma once
 
 #include <limits.h>
-#include <pthread.h>
-#include <list>
+
+#include <atomic>
+#include <functional>
+#include <mutex>
 #include <string>
 #include <vector>
 
-#include <boost/thread/locks.hpp>
-#include <boost/thread/mutex.hpp>
-#include <boost/thread/locks.hpp>
-
 #include <glog/logging.h>
 
-#include "folly/Foreach.h"
-#include "folly/Malloc.h"
+#include <folly/Exception.h>
+#include <folly/Function.h>
+#include <folly/Portability.h>
+#include <folly/ScopeGuard.h>
+#include <folly/SharedMutex.h>
+#include <folly/container/Foreach.h>
+#include <folly/detail/AtFork.h>
+#include <folly/memory/Malloc.h>
+#include <folly/portability/PThread.h>
+#include <folly/synchronization/MicroSpinLock.h>
+
+#include <folly/detail/StaticSingletonManager.h>
+
+// In general, emutls cleanup is not guaranteed to play nice with the way
+// StaticMeta mixes direct pthread calls and the use of __thread. This has
+// caused problems on multiple platforms so don't use __thread there.
+//
+// XXX: Ideally we would instead determine if emutls is in use at runtime as it
+// is possible to configure glibc on Linux to use emutls regardless.
+#if !FOLLY_MOBILE && !defined(__APPLE__) && !defined(_MSC_VER)
+#define FOLLY_TLD_USE_FOLLY_TLS 1
+#else
+#undef FOLLY_TLD_USE_FOLLY_TLS
+#endif
 
 namespace folly {
+
+enum class TLPDestructionMode { THIS_THREAD, ALL_THREADS };
+struct AccessModeStrict {};
+
 namespace threadlocal_detail {
 
-/**
- * Base class for deleters.
- */
-class DeleterBase {
- public:
-  virtual ~DeleterBase() { }
-  virtual void dispose(void* ptr, TLPDestructionMode mode) const = 0;
-};
+constexpr uint32_t kEntryIDInvalid = std::numeric_limits<uint32_t>::max();
 
-/**
- * Simple deleter class that calls delete on the passed-in pointer.
+struct ThreadEntry;
+/* This represents a node in doubly linked list where all the nodes
+ * are part of an ElementWrapper struct that has the same id.
+ * we cannot use prev and next as ThreadEntryNode pointers since the
+ * ThreadEntry::elements can be reallocated and the pointers will change
+ * in this case. So we keep a pointer to the parent ThreadEntry struct
+ * one for the prev and next and also the id.
+ * We will traverse and update the list only when holding the
+ * StaticMetaBase::lock_
  */
-template <class Ptr>
-class SimpleDeleter : public DeleterBase {
- public:
-  virtual void dispose(void* ptr, TLPDestructionMode mode) const {
-    delete static_cast<Ptr>(ptr);
+struct ThreadEntryNode {
+  uint32_t id;
+  ThreadEntry* parent;
+  ThreadEntry* prev;
+  ThreadEntry* next;
+
+  void initIfZero(bool locked);
+
+  void init(ThreadEntry* entry, uint32_t newId) {
+    id = newId;
+    parent = prev = next = entry;
   }
-};
 
-/**
- * Custom deleter that calls a given callable.
- */
-template <class Ptr, class Deleter>
-class CustomDeleter : public DeleterBase {
- public:
-  explicit CustomDeleter(Deleter d) : deleter_(d) { }
-  virtual void dispose(void* ptr, TLPDestructionMode mode) const {
-    deleter_(static_cast<Ptr>(ptr), mode);
+  void initZero(ThreadEntry* entry, uint32_t newId) {
+    id = newId;
+    parent = entry;
+    prev = next = nullptr;
   }
- private:
-  Deleter deleter_;
-};
 
+  // if the list this node is part of is empty
+  FOLLY_ALWAYS_INLINE bool empty() const {
+    return (next == parent);
+  }
+
+  FOLLY_ALWAYS_INLINE bool zero() const {
+    return (!prev);
+  }
+
+  FOLLY_ALWAYS_INLINE ThreadEntry* getThreadEntry() {
+    return parent;
+  }
+
+  FOLLY_ALWAYS_INLINE ThreadEntryNode* getPrev();
+
+  FOLLY_ALWAYS_INLINE ThreadEntryNode* getNext();
+
+  void push_back(ThreadEntry* head);
+
+  void eraseZero();
+};
 
 /**
  * POD wrapper around an element (a void*) and an associated deleter.
  * This must be POD, as we memset() it to 0 and memcpy() it around.
  */
 struct ElementWrapper {
-  void dispose(TLPDestructionMode mode) {
-    if (ptr != NULL) {
-      DCHECK(deleter != NULL);
-      deleter->dispose(ptr, mode);
-      if (ownsDeleter) {
-        delete deleter;
-      }
-      ptr = NULL;
-      deleter = NULL;
-      ownsDeleter = false;
+  using DeleterFunType = void(void*, TLPDestructionMode);
+
+  bool dispose(TLPDestructionMode mode) {
+    if (ptr == nullptr) {
+      return false;
     }
+
+    DCHECK(deleter1 != nullptr);
+    ownsDeleter ? (*deleter2)(ptr, mode) : (*deleter1)(ptr, mode);
+    return true;
+  }
+
+  void* release() {
+    auto retPtr = ptr;
+
+    if (ptr != nullptr) {
+      cleanup();
+    }
+
+    return retPtr;
   }
 
   template <class Ptr>
   void set(Ptr p) {
-    DCHECK(ptr == NULL);
-    DCHECK(deleter == NULL);
+    auto guard = makeGuard([&] { delete p; });
+    DCHECK(ptr == nullptr);
+    DCHECK(deleter1 == nullptr);
 
     if (p) {
-      // We leak a single object here but that is ok.  If we used an
-      // object directly, there is a chance that the destructor will be
-      // called on that static object before any of the ElementWrappers
-      // are disposed and that isn't so nice.
-      static auto d = new SimpleDeleter<Ptr>();
+      node.initIfZero(true /*locked*/);
       ptr = p;
-      deleter = d;
+      deleter1 = [](void* pt, TLPDestructionMode) {
+        delete static_cast<Ptr>(pt);
+      };
       ownsDeleter = false;
+      guard.dismiss();
     }
   }
 
   template <class Ptr, class Deleter>
-  void set(Ptr p, Deleter d) {
-    DCHECK(ptr == NULL);
-    DCHECK(deleter == NULL);
+  void set(Ptr p, const Deleter& d) {
+    auto guard = makeGuard([&] {
+      if (p) {
+        d(p, TLPDestructionMode::THIS_THREAD);
+      }
+    });
+    DCHECK(ptr == nullptr);
+    DCHECK(deleter2 == nullptr);
     if (p) {
+      node.initIfZero(true /*locked*/);
       ptr = p;
-      deleter = new CustomDeleter<Ptr,Deleter>(d);
+      auto d2 = d; // gcc-4.8 doesn't decay types correctly in lambda captures
+      deleter2 = new std::function<DeleterFunType>(
+          [d2](void* pt, TLPDestructionMode mode) {
+            d2(static_cast<Ptr>(pt), mode);
+          });
       ownsDeleter = true;
+      guard.dismiss();
     }
   }
 
+  void cleanup() {
+    if (ownsDeleter) {
+      delete deleter2;
+    }
+    ptr = nullptr;
+    deleter1 = nullptr;
+    ownsDeleter = false;
+  }
+
   void* ptr;
-  DeleterBase* deleter;
+  union {
+    DeleterFunType* deleter1;
+    std::function<DeleterFunType>* deleter2;
+  };
   bool ownsDeleter;
+  ThreadEntryNode node;
 };
+
+struct StaticMetaBase;
+struct ThreadEntryList;
 
 /**
  * Per-thread entry.  Each thread using a StaticMeta object has one.
  * This is written from the owning thread only (under the lock), read
  * from the owning thread (no lock necessary), and read from other threads
  * (under the lock).
+ * StaticMetaBase::head_ elementsCapacity can be read from any thread on
+ * reallocate (no lock)
  */
 struct ThreadEntry {
-  ElementWrapper* elements;
-  size_t elementsCapacity;
-  ThreadEntry* next;
-  ThreadEntry* prev;
-};
+  ElementWrapper* elements{nullptr};
+  std::atomic<size_t> elementsCapacity{0};
+  ThreadEntry* next{nullptr};
+  ThreadEntry* prev{nullptr};
+  ThreadEntryList* list{nullptr};
+  ThreadEntry* listNext{nullptr};
+  StaticMetaBase* meta{nullptr};
+  bool removed_{false};
 
-// Held in a singleton to track our global instances.
-// We have one of these per "Tag", by default one for the whole system
-// (Tag=void).
-//
-// Creating and destroying ThreadLocalPtr objects, as well as thread exit
-// for threads that use ThreadLocalPtr objects collide on a lock inside
-// StaticMeta; you can specify multiple Tag types to break that lock.
-template <class Tag>
-struct StaticMeta {
-  static StaticMeta<Tag>& instance() {
-    // Leak it on exit, there's only one per process and we don't have to
-    // worry about synchronization with exiting threads.
-    static bool constructed = (inst = new StaticMeta<Tag>());
-    (void)constructed; // suppress unused warning
-    return *inst;
+  size_t getElementsCapacity() const noexcept {
+    return elementsCapacity.load(std::memory_order_relaxed);
   }
 
-  int nextId_;
-  std::vector<int> freeIds_;
-  boost::mutex lock_;
-  pthread_key_t pthreadKey_;
-  ThreadEntry head_;
+  void setElementsCapacity(size_t capacity) noexcept {
+    elementsCapacity.store(capacity, std::memory_order_relaxed);
+  }
+};
+
+struct ThreadEntryList {
+  ThreadEntry* head{nullptr};
+  size_t count{0};
+};
+
+struct PthreadKeyUnregisterTester;
+
+FOLLY_ALWAYS_INLINE ThreadEntryNode* ThreadEntryNode::getPrev() {
+  return &prev->elements[id].node;
+}
+
+FOLLY_ALWAYS_INLINE ThreadEntryNode* ThreadEntryNode::getNext() {
+  return &next->elements[id].node;
+}
+
+/**
+ * We want to disable onThreadExit call at the end of shutdown, we don't care
+ * about leaking memory at that point.
+ *
+ * Otherwise if ThreadLocal is used in a shared library, onThreadExit may be
+ * called after dlclose().
+ *
+ * This class has one single static instance; however since it's so widely used,
+ * directly or indirectly, by so many classes, we need to take care to avoid
+ * problems stemming from the Static Initialization/Destruction Order Fiascos.
+ * Therefore this class needs to be constexpr-constructible, so as to avoid
+ * the need for this to participate in init/destruction order.
+ */
+class PthreadKeyUnregister {
+ public:
+  static constexpr size_t kMaxKeys = 1UL << 16;
+
+  ~PthreadKeyUnregister() {
+    // If static constructor priorities are not supported then
+    // ~PthreadKeyUnregister logic is not safe.
+#if !defined(__APPLE__) && !defined(_MSC_VER)
+    MSLGuard lg(lock_);
+    while (size_) {
+      pthread_key_delete(keys_[--size_]);
+    }
+#endif
+  }
+
+  static void registerKey(pthread_key_t key) {
+    instance_.registerKeyImpl(key);
+  }
+
+ private:
+  /**
+   * Only one global instance should exist, hence this is private.
+   * See also the important note at the top of this class about `constexpr`
+   * usage.
+   */
+  constexpr PthreadKeyUnregister() : lock_(), size_(0), keys_() {}
+  friend struct folly::threadlocal_detail::PthreadKeyUnregisterTester;
+
+  void registerKeyImpl(pthread_key_t key) {
+    MSLGuard lg(lock_);
+    if (size_ == kMaxKeys) {
+      throw std::logic_error("pthread_key limit has already been reached");
+    }
+    keys_[size_++] = key;
+  }
+
+  MicroSpinLock lock_;
+  size_t size_;
+  pthread_key_t keys_[kMaxKeys];
+
+  static PthreadKeyUnregister instance_;
+};
+
+struct StaticMetaBase {
+  // Represents an ID of a thread local object. Initially set to the maximum
+  // uint. This representation allows us to avoid a branch in accessing TLS data
+  // (because if you test capacity > id if id = maxint then the test will always
+  // fail). It allows us to keep a constexpr constructor and avoid SIOF.
+  class EntryID {
+   public:
+    std::atomic<uint32_t> value;
+
+    constexpr EntryID() : value(kEntryIDInvalid) {}
+
+    EntryID(EntryID&& other) noexcept : value(other.value.load()) {
+      other.value = kEntryIDInvalid;
+    }
+
+    EntryID& operator=(EntryID&& other) {
+      assert(this != &other);
+      value = other.value.load();
+      other.value = kEntryIDInvalid;
+      return *this;
+    }
+
+    EntryID(const EntryID& other) = delete;
+    EntryID& operator=(const EntryID& other) = delete;
+
+    uint32_t getOrInvalid() {
+      // It's OK for this to be relaxed, even though we're effectively doing
+      // double checked locking in using this value. We only care about the
+      // uniqueness of IDs, getOrAllocate does not modify any other memory
+      // this thread will use.
+      return value.load(std::memory_order_relaxed);
+    }
+
+    uint32_t getOrAllocate(StaticMetaBase& meta) {
+      uint32_t id = getOrInvalid();
+      if (id != kEntryIDInvalid) {
+        return id;
+      }
+      // The lock inside allocate ensures that a single value is allocated
+      return meta.allocate(this);
+    }
+  };
+
+  StaticMetaBase(ThreadEntry* (*threadEntry)(), bool strict);
 
   void push_back(ThreadEntry* t) {
     t->next = &head_;
@@ -170,168 +354,185 @@ struct StaticMeta {
     t->next = t->prev = t;
   }
 
-  static __thread ThreadEntry threadEntry_;
-  static StaticMeta<Tag>* inst;
+  FOLLY_EXPORT static ThreadEntryList* getThreadEntryList();
 
-  StaticMeta() : nextId_(1) {
-    head_.next = head_.prev = &head_;
-    int ret = pthread_key_create(&pthreadKey_, &onThreadExit);
-    if (ret != 0) {
-      std::string msg;
-      switch (ret) {
-        case EAGAIN:
-          char buf[100];
-          snprintf(buf, sizeof(buf), "PTHREAD_KEYS_MAX (%d) is exceeded",
-                   PTHREAD_KEYS_MAX);
-          msg = buf;
-          break;
-        case ENOMEM:
-          msg = "Out-of-memory";
-          break;
-        default:
-          msg = "(unknown error)";
-      }
-      throw std::runtime_error("pthread_key_create failed: " + msg);
-    }
-  }
-  ~StaticMeta() {
-    LOG(FATAL) << "StaticMeta lives forever!";
-  }
+  static void onThreadExit(void* ptr);
 
-  static void onThreadExit(void* ptr) {
-    auto & meta = instance();
-    DCHECK_EQ(ptr, &meta);
-    // We wouldn't call pthread_setspecific unless we actually called get()
-    DCHECK_NE(threadEntry_.elementsCapacity, 0);
-    {
-      boost::lock_guard<boost::mutex> g(meta.lock_);
-      meta.erase(&threadEntry_);
-      // No need to hold the lock any longer; threadEntry_ is private to this
-      // thread now that it's been removed from meta.
-    }
-    FOR_EACH_RANGE(i, 0, threadEntry_.elementsCapacity) {
-      threadEntry_.elements[i].dispose(TLPDestructionMode::THIS_THREAD);
-    }
-    free(threadEntry_.elements);
-    threadEntry_.elements = NULL;
-    pthread_setspecific(meta.pthreadKey_, NULL);
-  }
+  // returns the elementsCapacity for the
+  // current thread ThreadEntry struct
+  uint32_t elementsCapacity() const;
 
-  static int create() {
-    int id;
-    auto & meta = instance();
-    boost::lock_guard<boost::mutex> g(meta.lock_);
-    if (!meta.freeIds_.empty()) {
-      id = meta.freeIds_.back();
-      meta.freeIds_.pop_back();
-    } else {
-      id = meta.nextId_++;
-    }
-    return id;
-  }
+  uint32_t allocate(EntryID* ent);
 
-  static void destroy(int id) {
-    try {
-      auto & meta = instance();
-      // Elements in other threads that use this id.
-      std::vector<ElementWrapper> elements;
-      {
-        boost::lock_guard<boost::mutex> g(meta.lock_);
-        for (ThreadEntry* e = meta.head_.next; e != &meta.head_; e = e->next) {
-          if (id < e->elementsCapacity && e->elements[id].ptr) {
-            elements.push_back(e->elements[id]);
-
-            // Writing another thread's ThreadEntry from here is fine;
-            // the only other potential reader is the owning thread --
-            // from onThreadExit (which grabs the lock, so is properly
-            // synchronized with us) or from get() -- but using get() on a
-            // ThreadLocalPtr object that's being destroyed is a bug, so
-            // undefined behavior is fair game.
-            e->elements[id].ptr = NULL;
-            e->elements[id].deleter = NULL;
-          }
-        }
-        meta.freeIds_.push_back(id);
-      }
-      // Delete elements outside the lock
-      FOR_EACH(it, elements) {
-        it->dispose(TLPDestructionMode::ALL_THREADS);
-      }
-    } catch (...) { // Just in case we get a lock error or something anyway...
-      LOG(WARNING) << "Destructor discarding an exception that was thrown.";
-    }
-  }
+  void destroy(EntryID* ent);
 
   /**
-   * Reserve enough space in the threadEntry_.elements for the item
+   * Reserve enough space in the ThreadEntry::elements for the item
    * @id to fit in.
    */
-  static void reserve(int id) {
-    size_t prevSize = threadEntry_.elementsCapacity;
-    size_t newSize = static_cast<size_t>((id + 5) * 1.7);
-    auto& meta = instance();
-    ElementWrapper* ptr = nullptr;
-    // Rely on jemalloc to zero the memory if possible -- maybe it knows
-    // it's already zeroed and saves us some work.
-    if (!usingJEMalloc() ||
-        prevSize < jemallocMinInPlaceExpandable ||
-        (rallocm(
-          static_cast<void**>(static_cast<void*>(&threadEntry_.elements)),
-          NULL, newSize * sizeof(ElementWrapper), 0,
-          ALLOCM_NO_MOVE | ALLOCM_ZERO) != ALLOCM_SUCCESS)) {
-      // Sigh, must realloc, but we can't call realloc here, as elements is
-      // still linked in meta, so another thread might access invalid memory
-      // after realloc succeeds.  We'll copy by hand and update threadEntry_
-      // under the lock.
-      //
-      // Note that we're using calloc instead of malloc in order to zero
-      // the entire region.  rallocm (ALLOCM_ZERO) will only zero newly
-      // allocated memory, so if a previous allocation allocated more than
-      // we requested, it's our responsibility to guarantee that the tail
-      // is zeroed.  calloc() is simpler than malloc() followed by memset(),
-      // and potentially faster when dealing with a lot of memory, as
-      // it can get already-zeroed pages from the kernel.
-      if ((ptr = static_cast<ElementWrapper*>(
-             calloc(newSize, sizeof(ElementWrapper)))) != nullptr) {
-        memcpy(ptr, threadEntry_.elements, sizeof(ElementWrapper) * prevSize);
-      } else {
-        throw std::bad_alloc();
-      }
-    }
+  void reserve(EntryID* id);
 
-    // Success, update the entry
-    {
-      boost::lock_guard<boost::mutex> g(meta.lock_);
-      if (prevSize == 0) {
-        meta.push_back(&threadEntry_);
-      }
-      if (ptr) {
-        using std::swap;
-        swap(ptr, threadEntry_.elements);
-      }
-      threadEntry_.elementsCapacity = newSize;
-    }
+  ElementWrapper& getElement(EntryID* ent);
 
-    free(ptr);
+  // reserve an id in the head_ ThreadEntry->elements
+  // array if not already there
+  void reserveHeadUnlocked(uint32_t id);
 
-    if (prevSize == 0) {
-      pthread_setspecific(meta.pthreadKey_, &meta);
-    }
-  }
+  // push back an entry in the doubly linked list
+  // that corresponds to idx id
+  void pushBackLocked(ThreadEntry* t, uint32_t id);
+  void pushBackUnlocked(ThreadEntry* t, uint32_t id);
 
-  static ElementWrapper& get(int id) {
-    if (UNLIKELY(threadEntry_.elementsCapacity <= id)) {
-      reserve(id);
-    }
-    return threadEntry_.elements[id];
-  }
+  // static helper method to reallocate the ThreadEntry::elements
+  // returns != nullptr if the ThreadEntry::elements was reallocated
+  // nullptr if the ThreadEntry::elements was just extended
+  // and throws stdd:bad_alloc if memory cannot be allocated
+  static ElementWrapper*
+  reallocate(ThreadEntry* threadEntry, uint32_t idval, size_t& newCapacity);
+
+  uint32_t nextId_;
+  std::vector<uint32_t> freeIds_;
+  std::mutex lock_;
+  SharedMutex accessAllThreadsLock_;
+  pthread_key_t pthreadKey_;
+  ThreadEntry head_;
+  ThreadEntry* (*threadEntry_)();
+  bool strict_;
+
+ protected:
+  ~StaticMetaBase() {}
 };
 
-template <class Tag> __thread ThreadEntry StaticMeta<Tag>::threadEntry_ = {0};
-template <class Tag> StaticMeta<Tag>* StaticMeta<Tag>::inst = nullptr;
+// Held in a singleton to track our global instances.
+// We have one of these per "Tag", by default one for the whole system
+// (Tag=void).
+//
+// Creating and destroying ThreadLocalPtr objects, as well as thread exit
+// for threads that use ThreadLocalPtr objects collide on a lock inside
+// StaticMeta; you can specify multiple Tag types to break that lock.
+template <class Tag, class AccessMode>
+struct StaticMeta final : StaticMetaBase {
+  StaticMeta()
+      : StaticMetaBase(
+            &StaticMeta::getThreadEntrySlow,
+            std::is_same<AccessMode, AccessModeStrict>::value) {
+    detail::AtFork::registerHandler(
+        this,
+        /*prepare*/ &StaticMeta::preFork,
+        /*parent*/ &StaticMeta::onForkParent,
+        /*child*/ &StaticMeta::onForkChild);
+  }
 
-}  // namespace threadlocal_detail
-}  // namespace folly
+  ~StaticMeta() = delete;
 
-#endif /* FOLLY_DETAIL_THREADLOCALDETAIL_H_ */
+  static StaticMeta<Tag, AccessMode>& instance() {
+    // Leak it on exit, there's only one per process and we don't have to
+    // worry about synchronization with exiting threads.
+    return detail::createGlobal<StaticMeta<Tag, AccessMode>, void>();
+  }
 
+  FOLLY_EXPORT FOLLY_ALWAYS_INLINE static ElementWrapper& get(EntryID* ent) {
+    // Eliminate as many branches and as much extra code as possible in the
+    // cached fast path, leaving only one branch here and one indirection below.
+    uint32_t id = ent->getOrInvalid();
+#ifdef FOLLY_TLD_USE_FOLLY_TLS
+    static FOLLY_TLS ThreadEntry* threadEntry{};
+    static FOLLY_TLS size_t capacity{};
+#else
+    ThreadEntry* threadEntry{};
+    size_t capacity{};
+#endif
+    if (FOLLY_UNLIKELY(capacity <= id)) {
+      getSlowReserveAndCache(ent, id, threadEntry, capacity);
+    }
+    return threadEntry->elements[id];
+  }
+
+  FOLLY_NOINLINE static void getSlowReserveAndCache(
+      EntryID* ent,
+      uint32_t& id,
+      ThreadEntry*& threadEntry,
+      size_t& capacity) {
+    auto& inst = instance();
+    threadEntry = inst.threadEntry_();
+    if (UNLIKELY(threadEntry->getElementsCapacity() <= id)) {
+      inst.reserve(ent);
+      id = ent->getOrInvalid();
+    }
+    capacity = threadEntry->getElementsCapacity();
+    assert(capacity > id);
+  }
+
+  FOLLY_EXPORT FOLLY_NOINLINE static ThreadEntry* getThreadEntrySlow() {
+    auto& meta = instance();
+    auto key = meta.pthreadKey_;
+    ThreadEntry* threadEntry =
+        static_cast<ThreadEntry*>(pthread_getspecific(key));
+    if (!threadEntry) {
+      ThreadEntryList* threadEntryList = StaticMeta::getThreadEntryList();
+#ifdef FOLLY_TLD_USE_FOLLY_TLS
+      static FOLLY_TLS ThreadEntry threadEntrySingleton;
+      threadEntry = &threadEntrySingleton;
+#else
+      threadEntry = new ThreadEntry();
+#endif
+      // if the ThreadEntry already exists
+      // but pthread_getspecific returns NULL
+      // do not add the same entry twice to the list
+      // since this would create a loop in the list
+      if (!threadEntry->list) {
+        threadEntry->list = threadEntryList;
+        threadEntry->listNext = threadEntryList->head;
+        threadEntryList->head = threadEntry;
+      }
+
+      // if we're adding a thread entry
+      // we need to increment the list count
+      // even if the entry is reused
+      threadEntryList->count++;
+
+      threadEntry->meta = &meta;
+      int ret = pthread_setspecific(key, threadEntry);
+      checkPosixError(ret, "pthread_setspecific failed");
+    }
+    return threadEntry;
+  }
+
+  static bool preFork() {
+    return instance().lock_.try_lock(); // Make sure it's created
+  }
+
+  static void onForkParent() {
+    instance().lock_.unlock();
+  }
+
+  static void onForkChild() {
+    // only the current thread survives
+    auto& head = instance().head_;
+    // init the head list
+    head.next = head.prev = &head;
+    // init the circular lists
+    auto elementsCapacity = head.getElementsCapacity();
+    for (size_t i = 0u; i < elementsCapacity; ++i) {
+      head.elements[i].node.init(&head, static_cast<uint32_t>(i));
+    }
+    // init the thread entry
+    ThreadEntry* threadEntry = instance().threadEntry_();
+    elementsCapacity = threadEntry->getElementsCapacity();
+    for (size_t i = 0u; i < elementsCapacity; ++i) {
+      if (!threadEntry->elements[i].node.zero()) {
+        threadEntry->elements[i].node.initZero(
+            threadEntry, static_cast<uint32_t>(i));
+        threadEntry->elements[i].node.initIfZero(false /*locked*/);
+      }
+    }
+
+    // If this thread was in the list before the fork, add it back.
+    if (elementsCapacity != 0) {
+      instance().push_back(threadEntry);
+    }
+    instance().lock_.unlock();
+  }
+};
+} // namespace threadlocal_detail
+} // namespace folly

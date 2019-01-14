@@ -1,5 +1,5 @@
 /*
- * Copyright 2013 Facebook, Inc.
+ * Copyright 2012-present Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,56 +14,62 @@
  * limitations under the License.
  */
 
-#ifndef FOLLY_FORMAT_H_
+#pragma once
 #define FOLLY_FORMAT_H_
 
-#include <array>
+#include <cstdio>
+#include <stdexcept>
 #include <tuple>
 #include <type_traits>
-#include <vector>
-#include <deque>
-#include <map>
-#include <unordered_map>
 
-#include <double-conversion.h>
-
-#include "folly/FBVector.h"
-#include "folly/Conv.h"
-#include "folly/Range.h"
-#include "folly/Traits.h"
-#include "folly/Likely.h"
-#include "folly/String.h"
-#include "folly/small_vector.h"
-#include "folly/FormatArg.h"
+#include <folly/CPortability.h>
+#include <folly/Conv.h>
+#include <folly/FormatArg.h>
+#include <folly/Range.h>
+#include <folly/String.h>
+#include <folly/Traits.h>
 
 // Ignore shadowing warnings within this file, so includers can use -Wshadow.
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wshadow"
+FOLLY_PUSH_WARNING
+FOLLY_GNU_DISABLE_WARNING("-Wshadow")
 
 namespace folly {
 
 // forward declarations
-template <bool containerMode, class... Args> class Formatter;
+template <bool containerMode, class... Args>
+class Formatter;
 template <class... Args>
 Formatter<false, Args...> format(StringPiece fmt, Args&&... args);
 template <class C>
 Formatter<true, C> vformat(StringPiece fmt, C&& container);
-template <class T, class Enable=void> class FormatValue;
+template <class T, class Enable = void>
+class FormatValue;
+
+// meta-attribute to identify formatters in this sea of template weirdness
+namespace detail {
+class FormatterTag {};
+} // namespace detail
 
 /**
  * Formatter class.
  *
- * Note that this class is tricky, as it keeps *references* to its arguments
- * (and doesn't copy the passed-in format string).  Thankfully, you can't use
- * this directly, you have to use format(...) below.
+ * Note that this class is tricky, as it keeps *references* to its lvalue
+ * arguments (while it takes ownership of the temporaries), and it doesn't
+ * copy the passed-in format string. Thankfully, you can't use this
+ * directly, you have to use format(...) below.
  */
 
-template <bool containerMode, class... Args>
-class Formatter {
-  template <class... A>
-  friend Formatter<false, A...> format(StringPiece fmt, A&&... arg);
-  template <class C>
-  friend Formatter<true, C> vformat(StringPiece fmt, C&& container);
+/* BaseFormatter class.
+ * Overridable behaviours:
+ * You may override the actual formatting of positional parameters in
+ * `doFormatArg`. The Formatter class provides the default implementation.
+ *
+ * You may also override `doFormat` and `getSizeArg`. These override points were
+ * added to permit static analysis of format strings, when it is inconvenient
+ * or impossible to instantiate a BaseFormatter with the correct storage
+ */
+template <class Derived, bool containerMode, class... Args>
+class BaseFormatter {
  public:
   /**
    * Append to output.  out(StringPiece sp) may be called (more than once)
@@ -75,9 +81,9 @@ class Formatter {
    * Append to a string.
    */
   template <class Str>
-  typename std::enable_if<detail::IsSomeString<Str>::value>::type
-  appendTo(Str& str) const {
-    auto appender = [&str] (StringPiece s) { str.append(s.data(), s.size()); };
+  typename std::enable_if<IsSomeString<Str>::value>::type appendTo(
+      Str& str) const {
+    auto appender = [&str](StringPiece s) { str.append(s.data(), s.size()); };
     (*this)(appender);
   }
 
@@ -99,28 +105,23 @@ class Formatter {
     return s;
   }
 
+  /**
+   * Metadata to identify generated children of BaseFormatter
+   */
+  typedef detail::FormatterTag IsFormatter;
+  typedef BaseFormatter BaseType;
+
  private:
-  explicit Formatter(StringPiece str, Args&&... args);
-
-  // Not copyable
-  Formatter(const Formatter&) = delete;
-  Formatter& operator=(const Formatter&) = delete;
-
-  // Movable, but the move constructor and assignment operator are private,
-  // for the exclusive use of format() (below).  This way, you can't create
-  // a Formatter object, but can handle references to it (for streaming,
-  // conversion to string, etc) -- which is good, as Formatter objects are
-  // dangerous (they hold references, possibly to temporaries)
-  Formatter(Formatter&&) = default;
-  Formatter& operator=(Formatter&&) = default;
-
-  typedef std::tuple<FormatValue<
-      typename std::decay<Args>::type>...> ValueTuple;
+  typedef std::tuple<Args...> ValueTuple;
   static constexpr size_t valueCount = std::tuple_size<ValueTuple>::value;
+
+  Derived const& asDerived() const {
+    return *static_cast<const Derived*>(this);
+  }
 
   template <size_t K, class Callback>
   typename std::enable_if<K == valueCount>::type
-  doFormatFrom(size_t i, FormatArg& arg, Callback& cb) const {
+  doFormatFrom(size_t i, FormatArg& arg, Callback& /*cb*/) const {
     arg.error("argument index out of range, max=", i);
   }
 
@@ -128,9 +129,9 @@ class Formatter {
   typename std::enable_if<(K < valueCount)>::type
   doFormatFrom(size_t i, FormatArg& arg, Callback& cb) const {
     if (i == K) {
-      std::get<K>(values_).format(arg, cb);
+      asDerived().template doFormatArg<K>(arg, cb);
     } else {
-      doFormatFrom<K+1>(i, arg, cb);
+      doFormatFrom<K + 1>(i, arg, cb);
     }
   }
 
@@ -139,31 +140,145 @@ class Formatter {
     return doFormatFrom<0>(i, arg, cb);
   }
 
+  template <size_t K>
+  typename std::enable_if<K == valueCount, int>::type getSizeArgFrom(
+      size_t i,
+      const FormatArg& arg) const {
+    arg.error("argument index out of range, max=", i);
+  }
+
+  template <class T>
+  typename std::enable_if<
+      std::is_integral<T>::value && !std::is_same<T, bool>::value,
+      int>::type
+  getValue(const FormatValue<T>& format, const FormatArg&) const {
+    return static_cast<int>(format.getValue());
+  }
+
+  template <class T>
+  typename std::enable_if<
+      !std::is_integral<T>::value || std::is_same<T, bool>::value,
+      int>::type
+  getValue(const FormatValue<T>&, const FormatArg& arg) const {
+    arg.error("dynamic field width argument must be integral");
+  }
+
+  template <size_t K>
+      typename std::enable_if <
+      K<valueCount, int>::type getSizeArgFrom(size_t i, const FormatArg& arg)
+          const {
+    if (i == K) {
+      return getValue(getFormatValue<K>(), arg);
+    }
+    return getSizeArgFrom<K + 1>(i, arg);
+  }
+
+  int getSizeArg(size_t i, const FormatArg& arg) const {
+    return getSizeArgFrom<0>(i, arg);
+  }
+
   StringPiece str_;
+
+ protected:
+  explicit BaseFormatter(StringPiece str, Args&&... args);
+
+  // Not copyable
+  BaseFormatter(const BaseFormatter&) = delete;
+  BaseFormatter& operator=(const BaseFormatter&) = delete;
+
+  // Movable, but the move constructor and assignment operator are private,
+  // for the exclusive use of format() (below).  This way, you can't create
+  // a Formatter object, but can handle references to it (for streaming,
+  // conversion to string, etc) -- which is good, as Formatter objects are
+  // dangerous (they may hold references).
+  BaseFormatter(BaseFormatter&&) = default;
+  BaseFormatter& operator=(BaseFormatter&&) = default;
+
+  template <size_t K>
+  using ArgType = typename std::tuple_element<K, ValueTuple>::type;
+
+  template <size_t K>
+  FormatValue<typename std::decay<ArgType<K>>::type> getFormatValue() const {
+    return FormatValue<typename std::decay<ArgType<K>>::type>(
+        std::get<K>(values_));
+  }
+
   ValueTuple values_;
+};
+
+template <bool containerMode, class... Args>
+class Formatter : public BaseFormatter<
+                      Formatter<containerMode, Args...>,
+                      containerMode,
+                      Args...> {
+ private:
+  explicit Formatter(StringPiece& str, Args&&... args)
+      : BaseFormatter<
+            Formatter<containerMode, Args...>,
+            containerMode,
+            Args...>(str, std::forward<Args>(args)...) {
+    static_assert(
+        !containerMode || sizeof...(Args) == 1,
+        "Exactly one argument required in container mode");
+  }
+
+  template <size_t K, class Callback>
+  void doFormatArg(FormatArg& arg, Callback& cb) const {
+    this->template getFormatValue<K>().format(arg, cb);
+  }
+
+  friend class BaseFormatter<
+      Formatter<containerMode, Args...>,
+      containerMode,
+      Args...>;
+
+  template <class... A>
+  friend Formatter<false, A...> format(StringPiece fmt, A&&... arg);
+  template <class C>
+  friend Formatter<true, C> vformat(StringPiece fmt, C&& container);
 };
 
 /**
  * Formatter objects can be written to streams.
  */
-template<bool containerMode, class... Args>
-std::ostream& operator<<(std::ostream& out,
-                         const Formatter<containerMode, Args...>& formatter) {
-  auto writer = [&out] (StringPiece sp) { out.write(sp.data(), sp.size()); };
+template <bool containerMode, class... Args>
+std::ostream& operator<<(
+    std::ostream& out,
+    const Formatter<containerMode, Args...>& formatter) {
+  auto writer = [&out](StringPiece sp) {
+    out.write(sp.data(), std::streamsize(sp.size()));
+  };
   formatter(writer);
   return out;
 }
+
+/**
+ * Formatter objects can be written to stdio FILEs.
+ */
+template <class Derived, bool containerMode, class... Args>
+void writeTo(
+    FILE* fp,
+    const BaseFormatter<Derived, containerMode, Args...>& formatter);
 
 /**
  * Create a formatter object.
  *
  * std::string formatted = format("{} {}", 23, 42).str();
  * LOG(INFO) << format("{} {}", 23, 42);
+ * writeTo(stdout, format("{} {}", 23, 42));
  */
 template <class... Args>
 Formatter<false, Args...> format(StringPiece fmt, Args&&... args) {
-  return Formatter<false, Args...>(
-      fmt, std::forward<Args>(args)...);
+  return Formatter<false, Args...>(fmt, std::forward<Args>(args)...);
+}
+
+/**
+ * Like format(), but immediately returns the formatted string instead of an
+ * intermediate format object.
+ */
+template <class... Args>
+inline std::string sformat(StringPiece fmt, Args&&... args) {
+  return format(fmt, std::forward<Args>(args)...).str();
 }
 
 /**
@@ -181,8 +296,64 @@ Formatter<false, Args...> format(StringPiece fmt, Args&&... args) {
  */
 template <class Container>
 Formatter<true, Container> vformat(StringPiece fmt, Container&& container) {
-  return Formatter<true, Container>(
-      fmt, std::forward<Container>(container));
+  return Formatter<true, Container>(fmt, std::forward<Container>(container));
+}
+
+/**
+ * Like vformat(), but immediately returns the formatted string instead of an
+ * intermediate format object.
+ */
+template <class Container>
+inline std::string svformat(StringPiece fmt, Container&& container) {
+  return vformat(fmt, std::forward<Container>(container)).str();
+}
+
+/**
+ * Exception class thrown when a format key is not found in the given
+ * associative container keyed by strings. We inherit std::out_of_range for
+ * compatibility with callers that expect exception to be thrown directly
+ * by std::map or std::unordered_map.
+ *
+ * Having the key be at the end of the message string, we can access it by
+ * simply adding its offset to what(). Not storing separate std::string key
+ * makes the exception type small and noexcept-copyable like std::out_of_range,
+ * and therefore able to fit in-situ in exception_wrapper.
+ */
+class FOLLY_EXPORT FormatKeyNotFoundException : public std::out_of_range {
+ public:
+  explicit FormatKeyNotFoundException(StringPiece key);
+
+  char const* key() const noexcept {
+    return what() + kMessagePrefix.size();
+  }
+
+ private:
+  static constexpr StringPiece const kMessagePrefix = "format key not found: ";
+};
+
+/**
+ * Wrap a sequence or associative container so that out-of-range lookups
+ * return a default value rather than throwing an exception.
+ *
+ * Usage:
+ * format("[no_such_key"], defaulted(map, 42))  -> 42
+ */
+namespace detail {
+template <class Container, class Value>
+struct DefaultValueWrapper {
+  DefaultValueWrapper(const Container& container, const Value& defaultValue)
+      : container(container), defaultValue(defaultValue) {}
+
+  const Container& container;
+  const Value& defaultValue;
+};
+} // namespace detail
+
+template <class Container, class Value>
+detail::DefaultValueWrapper<Container, Value> defaulted(
+    const Container& c,
+    const Value& v) {
+  return detail::DefaultValueWrapper<Container, Value>(c, v);
 }
 
 /**
@@ -194,7 +365,7 @@ Formatter<true, Container> vformat(StringPiece fmt, Container&& container) {
  * Shortcut for toAppend(format(...), &foo);
  */
 template <class Str, class... Args>
-typename std::enable_if<detail::IsSomeString<Str>::value>::type
+typename std::enable_if<IsSomeString<Str>::value>::type
 format(Str* out, StringPiece fmt, Args&&... args) {
   format(fmt, std::forward<Args>(args)...).appendTo(*out);
 }
@@ -203,7 +374,7 @@ format(Str* out, StringPiece fmt, Args&&... args) {
  * Append vformatted output to a string.
  */
 template <class Str, class Container>
-typename std::enable_if<detail::IsSomeString<Str>::value>::type
+typename std::enable_if<IsSomeString<Str>::value>::type
 vformat(Str* out, StringPiece fmt, Container&& container) {
   vformat(fmt, std::forward<Container>(container)).appendTo(*out);
 }
@@ -230,21 +401,28 @@ void formatString(StringPiece val, FormatArg& arg, FormatCallback& cb);
  * field width")
  */
 template <class FormatCallback>
-void formatNumber(StringPiece val, int prefixLen, FormatArg& arg,
-                  FormatCallback& cb);
-
+void formatNumber(
+    StringPiece val,
+    int prefixLen,
+    FormatArg& arg,
+    FormatCallback& cb);
 
 /**
  * Format a Formatter object recursively.  Behaves just like
  * formatString(fmt.str(), arg, cb); but avoids creating a temporary
  * string if possible.
  */
-template <class FormatCallback, bool containerMode, class... Args>
-void formatFormatter(const Formatter<containerMode, Args...>& formatter,
-                     FormatArg& arg,
-                     FormatCallback& cb);
+template <
+    class FormatCallback,
+    class Derived,
+    bool containerMode,
+    class... Args>
+void formatFormatter(
+    const BaseFormatter<Derived, containerMode, Args...>& formatter,
+    FormatArg& arg,
+    FormatCallback& cb);
 
-}  // namespace format_value
+} // namespace format_value
 
 /*
  * Specialize folly::FormatValue for your type.
@@ -268,10 +446,52 @@ void formatFormatter(const Formatter<containerMode, Args...>& formatter,
  * empty string)
  */
 
-}  // namespace folly
+namespace detail {
 
-#include "folly/Format-inl.h"
+template <class T, class Enable = void>
+struct IsFormatter : public std::false_type {};
 
-#pragma GCC diagnostic pop
+template <class T>
+struct IsFormatter<
+    T,
+    typename std::enable_if<
+        std::is_same<typename T::IsFormatter, detail::FormatterTag>::value>::
+        type> : public std::true_type {};
+} // namespace detail
 
-#endif /* FOLLY_FORMAT_H_ */
+// Deprecated API. formatChecked() et. al. now behave identically to their
+// non-Checked counterparts.
+template <class... Args>
+Formatter<false, Args...> formatChecked(StringPiece fmt, Args&&... args) {
+  return format(fmt, std::forward<Args>(args)...);
+}
+template <class... Args>
+inline std::string sformatChecked(StringPiece fmt, Args&&... args) {
+  return formatChecked(fmt, std::forward<Args>(args)...).str();
+}
+template <class Container>
+Formatter<true, Container> vformatChecked(
+    StringPiece fmt,
+    Container&& container) {
+  return vformat(fmt, std::forward<Container>(container));
+}
+template <class Container>
+inline std::string svformatChecked(StringPiece fmt, Container&& container) {
+  return vformatChecked(fmt, std::forward<Container>(container)).str();
+}
+template <class Str, class... Args>
+typename std::enable_if<IsSomeString<Str>::value>::type
+formatChecked(Str* out, StringPiece fmt, Args&&... args) {
+  formatChecked(fmt, std::forward<Args>(args)...).appendTo(*out);
+}
+template <class Str, class Container>
+typename std::enable_if<IsSomeString<Str>::value>::type
+vformatChecked(Str* out, StringPiece fmt, Container&& container) {
+  vformatChecked(fmt, std::forward<Container>(container)).appendTo(*out);
+}
+
+} // namespace folly
+
+#include <folly/Format-inl.h>
+
+FOLLY_POP_WARNING

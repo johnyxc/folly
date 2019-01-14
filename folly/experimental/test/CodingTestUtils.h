@@ -1,5 +1,5 @@
 /*
- * Copyright 2013 Facebook, Inc.
+ * Copyright 2013-present Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,28 +14,34 @@
  * limitations under the License.
  */
 
-#ifndef FOLLY_EXPERIMENTAL_CODING_TEST_UTILS_H
-#define FOLLY_EXPERIMENTAL_CODING_TEST_UTILS_H
+#pragma once
 
 #include <algorithm>
 #include <fstream>
 #include <limits>
 #include <random>
 #include <string>
-#include <vector>
 #include <unordered_set>
+#include <vector>
+
 #include <glog/logging.h>
-#include <gtest/gtest.h>
 
-namespace folly { namespace compression {
+#include <folly/Benchmark.h>
+#include <folly/Likely.h>
+#include <folly/Optional.h>
+#include <folly/experimental/Instructions.h>
+#include <folly/portability/GTest.h>
 
-std::vector<uint32_t> generateRandomList(size_t n, uint32_t maxId) {
+namespace folly {
+namespace compression {
+
+template <class URNG>
+std::vector<uint32_t> generateRandomList(size_t n, uint32_t maxId, URNG&& g) {
   CHECK_LT(n, 2 * maxId);
-  std::mt19937 gen;
   std::uniform_int_distribution<> uid(1, maxId);
   std::unordered_set<uint32_t> dataset;
   while (dataset.size() < n) {
-    uint32_t value = uid(gen);
+    uint32_t value = uid(g);
     if (dataset.count(value) == 0) {
       dataset.insert(value);
     }
@@ -46,8 +52,13 @@ std::vector<uint32_t> generateRandomList(size_t n, uint32_t maxId) {
   return ids;
 }
 
-std::vector<uint32_t> generateSeqList(uint32_t minId, uint32_t maxId,
-                                      uint32_t step = 1) {
+inline std::vector<uint32_t> generateRandomList(size_t n, uint32_t maxId) {
+  std::mt19937 gen;
+  return generateRandomList(n, maxId, gen);
+}
+
+inline std::vector<uint32_t>
+generateSeqList(uint32_t minId, uint32_t maxId, uint32_t step = 1) {
   CHECK_LE(minId, maxId);
   CHECK_GT(step, 0);
   std::vector<uint32_t> ids;
@@ -58,7 +69,7 @@ std::vector<uint32_t> generateSeqList(uint32_t minId, uint32_t maxId,
   return ids;
 }
 
-std::vector<uint32_t> loadList(const std::string& filename) {
+inline std::vector<uint32_t> loadList(const std::string& filename) {
   std::ifstream fin(filename);
   std::vector<uint32_t> result;
   uint32_t id;
@@ -68,51 +79,79 @@ std::vector<uint32_t> loadList(const std::string& filename) {
   return result;
 }
 
-template <class Reader, class List>
-void testEmpty() {
-  List list;
-  const typename List::ValueType* const data = nullptr;
-  List::encode(data, 0, list);
-  {
-    Reader reader(list);
-    EXPECT_FALSE(reader.next());
-    EXPECT_EQ(reader.size(), 0);
+// Test previousValue only if Reader has it.
+template <class... Args>
+void maybeTestPreviousValue(Args&&...) {}
+
+// Make all the arguments template because if the types are not exact,
+// the above overload will be picked (for example i could be size_t or
+// ssize_t).
+template <class Vector, class Reader, class Index>
+auto maybeTestPreviousValue(const Vector& data, Reader& reader, Index i)
+    -> decltype(reader.previousValue(), void()) {
+  if (i != 0) {
+    EXPECT_EQ(reader.previousValue(), data[i - 1]);
   }
-  {
-    Reader reader(list);
-    EXPECT_FALSE(reader.skip(1));
-    EXPECT_FALSE(reader.skip(10));
+}
+
+// Test previous only if Reader has it.
+template <class... Args>
+void maybeTestPrevious(Args&&...) {}
+
+// Make all the arguments template because if the types are not exact,
+// the above overload will be picked (for example i could be size_t or
+// ssize_t).
+template <class Vector, class Reader, class Index>
+auto maybeTestPrevious(const Vector& data, Reader& reader, Index i)
+    -> decltype(reader.previous(), void()) {
+  auto r = reader.previous();
+  if (i != 0) {
+    EXPECT_TRUE(r);
+    EXPECT_EQ(reader.value(), data[i - 1]);
+  } else {
+    EXPECT_FALSE(r);
   }
-  {
-    Reader reader(list);
-    EXPECT_FALSE(reader.skipTo(1));
-  }
+  reader.next();
+  EXPECT_EQ(reader.value(), data[i]);
 }
 
 template <class Reader, class List>
 void testNext(const std::vector<uint32_t>& data, const List& list) {
   Reader reader(list);
-  EXPECT_EQ(reader.value(), 0);
+  EXPECT_FALSE(reader.valid());
+
   for (size_t i = 0; i < data.size(); ++i) {
     EXPECT_TRUE(reader.next());
+    EXPECT_TRUE(reader.valid());
     EXPECT_EQ(reader.value(), data[i]);
+    EXPECT_EQ(reader.position(), i);
+    maybeTestPreviousValue(data, reader, i);
+    maybeTestPrevious(data, reader, i);
   }
   EXPECT_FALSE(reader.next());
-  EXPECT_EQ(reader.value(), std::numeric_limits<uint32_t>::max());
+  EXPECT_FALSE(reader.valid());
+  EXPECT_EQ(reader.position(), reader.size());
 }
 
 template <class Reader, class List>
-void testSkip(const std::vector<uint32_t>& data, const List& list,
-              size_t skipStep) {
+void testSkip(
+    const std::vector<uint32_t>& data,
+    const List& list,
+    size_t skipStep) {
   CHECK_GT(skipStep, 0);
   Reader reader(list);
-  EXPECT_EQ(reader.value(), 0);
+
   for (size_t i = skipStep - 1; i < data.size(); i += skipStep) {
     EXPECT_TRUE(reader.skip(skipStep));
+    EXPECT_TRUE(reader.valid());
     EXPECT_EQ(reader.value(), data[i]);
+    EXPECT_EQ(reader.position(), i);
+    maybeTestPreviousValue(data, reader, i);
+    maybeTestPrevious(data, reader, i);
   }
   EXPECT_FALSE(reader.skip(skipStep));
-  EXPECT_EQ(reader.value(), std::numeric_limits<uint32_t>::max());
+  EXPECT_FALSE(reader.valid());
+  EXPECT_EQ(reader.position(), reader.size());
   EXPECT_FALSE(reader.next());
 }
 
@@ -127,12 +166,12 @@ void testSkip(const std::vector<uint32_t>& data, const List& list) {
 }
 
 template <class Reader, class List>
-void testSkipTo(const std::vector<uint32_t>& data, const List& list,
-                size_t skipToStep) {
+void testSkipTo(
+    const std::vector<uint32_t>& data,
+    const List& list,
+    size_t skipToStep) {
   CHECK_GT(skipToStep, 0);
-
   Reader reader(list);
-  EXPECT_EQ(reader.value(), 0);
 
   const uint32_t delta = std::max<uint32_t>(1, data.back() / skipToStep);
   uint32_t value = delta;
@@ -144,11 +183,15 @@ void testSkipTo(const std::vector<uint32_t>& data, const List& list,
       break;
     }
     EXPECT_TRUE(reader.skipTo(value));
+    EXPECT_TRUE(reader.valid());
     EXPECT_EQ(reader.value(), *it);
+    EXPECT_EQ(reader.position(), std::distance(data.begin(), it));
     value = reader.value() + delta;
+    maybeTestPreviousValue(data, reader, std::distance(data.begin(), it));
+    maybeTestPrevious(data, reader, std::distance(data.begin(), it));
   }
-
-  EXPECT_EQ(reader.value(), std::numeric_limits<uint32_t>::max());
+  EXPECT_FALSE(reader.valid());
+  EXPECT_EQ(reader.position(), reader.size());
   EXPECT_FALSE(reader.next());
 }
 
@@ -162,70 +205,231 @@ void testSkipTo(const std::vector<uint32_t>& data, const List& list) {
   }
   testSkipTo<Reader, List>(data, list, std::numeric_limits<size_t>::max());
   {
+    // Skip to the first element.
+    Reader reader(list);
+    EXPECT_TRUE(reader.skipTo(data[0]));
+    EXPECT_EQ(reader.value(), data[0]);
+    EXPECT_EQ(reader.position(), 0);
+  }
+  {
+    // Skip past the last element.
     Reader reader(list);
     EXPECT_FALSE(reader.skipTo(data.back() + 1));
-    EXPECT_EQ(reader.value(), std::numeric_limits<uint32_t>::max());
+    EXPECT_FALSE(reader.valid());
+    EXPECT_EQ(reader.position(), reader.size());
+    EXPECT_FALSE(reader.next());
+  }
+  {
+    // Skip to maximum integer.
+    Reader reader(list);
+    using ValueType = typename Reader::ValueType;
+    EXPECT_FALSE(reader.skipTo(std::numeric_limits<ValueType>::max()));
+    EXPECT_FALSE(reader.valid());
+    EXPECT_EQ(reader.position(), reader.size());
     EXPECT_FALSE(reader.next());
   }
 }
 
 template <class Reader, class List>
+void testJump(const std::vector<uint32_t>& data, const List& list) {
+  std::mt19937 gen;
+  std::vector<size_t> is(data.size());
+  for (size_t i = 0; i < data.size(); ++i) {
+    is[i] = i;
+  }
+  std::shuffle(is.begin(), is.end(), gen);
+  if (Reader::EncoderType::forwardQuantum == 0) {
+    is.resize(std::min<size_t>(is.size(), 100));
+  }
+
+  Reader reader(list);
+  for (auto i : is) {
+    EXPECT_TRUE(reader.jump(i));
+    EXPECT_EQ(reader.value(), data[i]);
+    EXPECT_EQ(reader.position(), i);
+    maybeTestPreviousValue(data, reader, i);
+    maybeTestPrevious(data, reader, i);
+  }
+  EXPECT_FALSE(reader.jump(data.size()));
+  EXPECT_FALSE(reader.valid());
+  EXPECT_EQ(reader.position(), reader.size());
+}
+
+template <class Reader, class List>
+void testJumpTo(const std::vector<uint32_t>& data, const List& list) {
+  CHECK(!data.empty());
+
+  Reader reader(list);
+
+  std::mt19937 gen;
+  std::uniform_int_distribution<> values(0, data.back());
+  const size_t iters = Reader::EncoderType::skipQuantum == 0 ? 100 : 10000;
+  for (size_t i = 0; i < iters; ++i) {
+    const uint32_t value = values(gen);
+    auto it = std::lower_bound(data.begin(), data.end(), value);
+    CHECK(it != data.end());
+    EXPECT_TRUE(reader.jumpTo(value));
+    EXPECT_EQ(reader.value(), *it);
+    EXPECT_EQ(reader.position(), std::distance(data.begin(), it));
+  }
+
+  EXPECT_TRUE(reader.jumpTo(0));
+  EXPECT_EQ(reader.value(), data[0]);
+  EXPECT_EQ(reader.position(), 0);
+
+  EXPECT_TRUE(reader.jumpTo(data.back()));
+  EXPECT_EQ(reader.value(), data.back());
+  EXPECT_EQ(reader.position(), reader.size() - 1);
+
+  EXPECT_FALSE(reader.jumpTo(data.back() + 1));
+  EXPECT_FALSE(reader.valid());
+  EXPECT_EQ(reader.position(), reader.size());
+}
+
+template <class Reader, class Encoder>
+void testEmpty() {
+  const typename Encoder::ValueType* const data = nullptr;
+  auto list = Encoder::encode(data, data);
+  {
+    Reader reader(list);
+    EXPECT_FALSE(reader.next());
+    EXPECT_EQ(reader.size(), 0);
+  }
+  {
+    Reader reader(list);
+    EXPECT_FALSE(reader.skip(1));
+    EXPECT_FALSE(reader.skip(10));
+    EXPECT_FALSE(reader.jump(0));
+    EXPECT_FALSE(reader.jump(10));
+  }
+  {
+    Reader reader(list);
+    EXPECT_FALSE(reader.skipTo(1));
+    EXPECT_FALSE(reader.jumpTo(1));
+  }
+}
+
+template <class Reader, class Encoder>
 void testAll(const std::vector<uint32_t>& data) {
-  List list;
-  List::encode(data.begin(), data.end(), list);
+  auto list = Encoder::encode(data.begin(), data.end());
   testNext<Reader>(data, list);
   testSkip<Reader>(data, list);
   testSkipTo<Reader>(data, list);
+  testJump<Reader>(data, list);
+  testJumpTo<Reader>(data, list);
   list.free();
 }
 
 template <class Reader, class List>
-void bmNext(const List& list, const std::vector<uint32_t>& data,
-            size_t iters) {
+void bmNext(const List& list, const std::vector<uint32_t>& data, size_t iters) {
   if (data.empty()) {
     return;
   }
-  for (size_t i = 0, j; i < iters; ) {
-    Reader reader(list);
-    for (j = 0; reader.next(); ++j, ++i) {
-      const uint32_t value = reader.value();
-      CHECK_EQ(value, data[j]) << j;
+
+  Reader reader(list);
+  for (size_t i = 0; i < iters; ++i) {
+    if (LIKELY(reader.next())) {
+      folly::doNotOptimizeAway(reader.value());
+    } else {
+      reader.reset();
     }
   }
 }
 
 template <class Reader, class List>
-void bmSkip(const List& list, const std::vector<uint32_t>& data,
-            size_t skip, size_t iters) {
-  if (skip >= data.size()) {
-    return;
-  }
-  for (size_t i = 0, j; i < iters; ) {
-    Reader reader(list);
-    for (j = skip - 1; j < data.size(); j += skip, ++i) {
-      reader.skip(skip);
-      const uint32_t value = reader.value();
-      CHECK_EQ(value, data[j]);
+void bmSkip(
+    const List& list,
+    const std::vector<uint32_t>& /* data */,
+    size_t logAvgSkip,
+    size_t iters) {
+  size_t avg = (size_t(1) << logAvgSkip);
+  size_t base = avg - (avg >> 2);
+  size_t mask = (avg > 1) ? (avg >> 1) - 1 : 0;
+
+  Reader reader(list);
+  for (size_t i = 0; i < iters; ++i) {
+    size_t skip = base + (i & mask);
+    if (LIKELY(reader.skip(skip))) {
+      folly::doNotOptimizeAway(reader.value());
+    } else {
+      reader.reset();
     }
   }
 }
 
 template <class Reader, class List>
-void bmSkipTo(const List& list, const std::vector<uint32_t>& data,
-              size_t skip, size_t iters) {
-  if (skip >= data.size()) {
-    return;
-  }
-  for (size_t i = 0, j; i < iters; ) {
-    Reader reader(list);
-    for (j = 0; j < data.size(); j += skip, ++i) {
-      reader.skipTo(data[j]);
-      const uint32_t value = reader.value();
-      CHECK_EQ(value, data[j]);
+void bmSkipTo(
+    const List& list,
+    const std::vector<uint32_t>& data,
+    size_t logAvgSkip,
+    size_t iters) {
+  size_t avg = (size_t(1) << logAvgSkip);
+  size_t base = avg - (avg >> 2);
+  size_t mask = (avg > 1) ? (avg >> 1) - 1 : 0;
+
+  Reader reader(list);
+  for (size_t i = 0, j = -1; i < iters; ++i) {
+    size_t skip = base + (i & mask);
+    j += skip;
+    if (j >= data.size()) {
+      reader.reset();
+      j = -1;
     }
+
+    reader.skipTo(data[j]);
+    folly::doNotOptimizeAway(reader.value());
   }
 }
 
-}}  // namespaces
+template <class Reader, class List>
+void bmJump(
+    const List& list,
+    const std::vector<uint32_t>& data,
+    const std::vector<size_t>& order,
+    size_t iters) {
+  CHECK(!data.empty());
+  CHECK_EQ(data.size(), order.size());
 
-#endif  // FOLLY_EXPERIMENTAL_CODING_TEST_UTILS_H
+  Reader reader(list);
+  for (size_t i = 0, j = 0; i < iters; ++i, ++j) {
+    if (j == order.size()) {
+      j = 0;
+    }
+    reader.jump(order[j]);
+    folly::doNotOptimizeAway(reader.value());
+  }
+}
+
+template <class Reader, class List>
+void bmJumpTo(
+    const List& list,
+    const std::vector<uint32_t>& data,
+    const std::vector<size_t>& order,
+    size_t iters) {
+  CHECK(!data.empty());
+  CHECK_EQ(data.size(), order.size());
+
+  Reader reader(list);
+  for (size_t i = 0, j = 0; i < iters; ++i, ++j) {
+    if (j == order.size()) {
+      j = 0;
+    }
+    reader.jumpTo(data[order[j]]);
+    folly::doNotOptimizeAway(reader.value());
+  }
+}
+
+folly::Optional<instructions::Type> instructionsOverride();
+
+template <class F>
+auto dispatchInstructions(F&& f)
+    -> decltype(f(std::declval<instructions::Default>())) {
+  if (auto type = instructionsOverride()) {
+    return instructions::dispatch(*type, std::forward<F>(f));
+  } else {
+    return instructions::dispatch(std::forward<F>(f));
+  }
+}
+
+} // namespace compression
+} // namespace folly

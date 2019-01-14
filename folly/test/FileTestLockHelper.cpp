@@ -1,5 +1,5 @@
 /*
- * Copyright 2013 Facebook, Inc.
+ * Copyright 2013-present Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,19 +14,19 @@
  * limitations under the License.
  */
 
-#include <gflags/gflags.h>
 #include <glog/logging.h>
 
-#include "folly/File.h"
+#include <folly/File.h>
+#include <folly/portability/GFlags.h>
 
 DEFINE_bool(s, false, "get shared lock");
 DEFINE_bool(x, false, "get exclusive lock");
 
-int main(int argc, char *argv[]) {
-  google::ParseCommandLineFlags(&argc, &argv, true);
+int main(int argc, char* argv[]) {
+  gflags::ParseCommandLineFlags(&argc, &argv, true);
   google::InitGoogleLogging(argv[0]);
   CHECK_EQ(FLAGS_s + FLAGS_x, 1)
-    << "exactly one of -s and -x must be specified";
+      << "exactly one of -s and -x must be specified";
   CHECK_EQ(argc, 2);
   folly::File f(argv[1], O_RDWR);
   bool r;

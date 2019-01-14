@@ -1,5 +1,5 @@
 /*
- * Copyright 2013 Facebook, Inc.
+ * Copyright 2011-present Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -13,22 +13,20 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-
 // @author: Xin Liu <xliux@fb.com>
 
 #include <map>
+#include <memory>
+#include <random>
 #include <set>
 #include <thread>
 
-#include <boost/shared_ptr.hpp>
-
-#include <gflags/gflags.h>
+#include <folly/Benchmark.h>
+#include <folly/ConcurrentSkipList.h>
+#include <folly/hash/Hash.h>
+#include <folly/portability/GFlags.h>
+#include <folly/synchronization/RWSpinLock.h>
 #include <glog/logging.h>
-#include "folly/Benchmark.h"
-#include "folly/ConcurrentSkipList.h"
-#include "folly/Hash.h"
-#include "folly/RWSpinLock.h"
-
 
 DEFINE_int32(num_threads, 12, "num concurrent threads to test");
 
@@ -56,7 +54,7 @@ static void initData() {
   for (int i = 0; i < kMaxValue; ++i) {
     gData[i] = i;
   }
-  std::random_shuffle(gData.begin(), gData.end());
+  std::shuffle(gData.begin(), gData.end(), std::mt19937{});
 }
 
 // single thread benchmarks
@@ -74,7 +72,9 @@ void BM_IterateOverSet(int iters, int size) {
   auto iter = a_set.begin();
   for (int i = 0; i < iters; ++i) {
     sum += *iter++;
-    if (iter == a_set.end()) iter = a_set.begin();
+    if (iter == a_set.end()) {
+      iter = a_set.begin();
+    }
   }
   BENCHMARK_SUSPEND {
     // VLOG(20) << "sum = " << sum;
@@ -94,7 +94,9 @@ void BM_IterateSkipList(int iters, int size) {
   auto iter = skipList.begin();
   for (int i = 0; i < iters; ++i) {
     sum += *iter++;
-    if (iter == skipList.end()) iter = skipList.begin();
+    if (iter == skipList.end()) {
+      iter = skipList.begin();
+    }
   }
 
   BENCHMARK_SUSPEND {
@@ -115,8 +117,10 @@ void BM_SetMerge(int iters, int size) {
   susp.dismiss();
 
   int64_t mergedSum = 0;
-  FOR_EACH(it, a_set) {
-    if (b_set.find(*it) != b_set.end()) mergedSum += *it;
+  FOR_EACH (it, a_set) {
+    if (b_set.find(*it) != b_set.end()) {
+      mergedSum += *it;
+    }
   }
   BENCHMARK_SUSPEND {
     // VLOG(20) << mergedSum;
@@ -138,8 +142,10 @@ void BM_CSLMergeLookup(int iters, int size) {
   susp.dismiss();
 
   SkipListType::Skipper skipper(skipList2);
-  FOR_EACH(it, skipList) {
-    if (skipper.to(*it)) mergedSum += *it;
+  FOR_EACH (it, skipList) {
+    if (skipper.to(*it)) {
+      mergedSum += *it;
+    }
   }
 
   BENCHMARK_SUSPEND {
@@ -304,7 +310,7 @@ BENCHMARK(Accessor, iters) {
   auto sl = skiplist.get();
 
   susp.dismiss();
-  for (int i = 0; i < iters; ++i) {
+  for (size_t i = 0; i < iters; ++i) {
     SkipListAccessor accessor(sl);
   }
 }
@@ -320,7 +326,7 @@ BENCHMARK(accessorBasicRefcounting, iters) {
   l.init();
 
   susp.dismiss();
-  for (int i = 0; i < iters; ++i) {
+  for (size_t i = 0; i < iters; ++i) {
     value->fetch_add(1, std::memory_order_relaxed);
     if (dirty->load(std::memory_order_acquire) != 0) {
       folly::MSLGuard g(l);
@@ -334,14 +340,13 @@ BENCHMARK(accessorBasicRefcounting, iters) {
   }
 }
 
-
 // Data For testing contention benchmark
 class ConcurrentAccessData {
  public:
-  explicit ConcurrentAccessData(int size) :
-    skipList_(SkipListType::create(10)),
-    sets_(FLAGS_num_sets), locks_(FLAGS_num_sets) {
-
+  explicit ConcurrentAccessData(int size)
+      : skipList_(SkipListType::create(10)),
+        sets_(FLAGS_num_sets),
+        locks_(FLAGS_num_sets) {
     for (int i = 0; i < size; ++i) {
       sets_[0].insert(i);
       skipList_.add(i);
@@ -349,9 +354,14 @@ class ConcurrentAccessData {
 
     for (int i = 0; i < FLAGS_num_sets; ++i) {
       locks_[i] = new RWSpinLock();
-      if (i > 0) sets_[i] = sets_[0];
+      if (i > 0) {
+        sets_[i] = sets_[0];
+      }
     }
 
+// This requires knowledge of the C++ library internals. Only use it if we're
+// using the GNU C++ library.
+#ifdef _GLIBCXX_SYMVER
     // memory usage
     int64_t setMemorySize = sets_[0].size() * sizeof(*sets_[0].begin()._M_node);
     int64_t cslMemorySize = 0;
@@ -360,8 +370,9 @@ class ConcurrentAccessData {
     }
 
     LOG(INFO) << "size=" << sets_[0].size()
-      << "; std::set memory size=" << setMemorySize
-      << "; csl memory size=" << cslMemorySize;
+              << "; std::set memory size=" << setMemorySize
+              << "; csl memory size=" << cslMemorySize;
+#endif
 
     readValues_.reserve(size);
     deleteValues_.reserve(size);
@@ -373,22 +384,23 @@ class ConcurrentAccessData {
       // half new values and half already in the list
       writeValues_.push_back((rand() % 2) + 2 * i);
     }
-    std::random_shuffle(readValues_.begin(), readValues_.end());
-    std::random_shuffle(deleteValues_.begin(), deleteValues_.end());
-    std::random_shuffle(writeValues_.begin(), writeValues_.end());
+    std::shuffle(readValues_.begin(), readValues_.end(), std::mt19937{});
+    std::shuffle(deleteValues_.begin(), deleteValues_.end(), std::mt19937{});
+    std::shuffle(writeValues_.begin(), writeValues_.end(), std::mt19937{});
   }
 
   ~ConcurrentAccessData() {
-    FOR_EACH(lock, locks_) delete *lock;
+    FOR_EACH (lock, locks_)
+      delete *lock;
   }
 
-  inline bool skipListFind(int idx, ValueType val) {
+  inline bool skipListFind(int /* idx */, ValueType val) {
     return skipList_.contains(val);
   }
-  inline void skipListInsert(int idx, ValueType val) {
+  inline void skipListInsert(int /* idx */, ValueType val) {
     skipList_.add(val);
   }
-  inline void skipListErase(int idx, ValueType val) {
+  inline void skipListErase(int /* idx */, ValueType val) {
     skipList_.remove(val);
   }
 
@@ -405,54 +417,54 @@ class ConcurrentAccessData {
     sets_[idx].erase(val);
   }
 
-  void runSkipList(int id, int iters) {
+  void runSkipList(int id, size_t iters) {
     int sum = 0;
-    for (int i = 0; i < iters; ++i) {
+    for (size_t i = 0; i < iters; ++i) {
       sum += accessSkipList(id, i);
     }
     // VLOG(20) << sum;
   }
 
-  void runSet(int id, int iters) {
+  void runSet(size_t id, size_t iters) {
     int sum = 0;
-    for (int i = 0; i < iters; ++i) {
+    for (size_t i = 0; i < iters; ++i) {
       sum += accessSet(id, i);
     }
     // VLOG(20) << sum;
   }
 
-  bool accessSkipList(int64_t id, int t) {
+  bool accessSkipList(int64_t id, size_t t) {
     if (t > readValues_.size()) {
       t = t % readValues_.size();
     }
     uint32_t h = folly::hash::twang_32from64(t * id);
     switch (h % 8) {
-      case 7:   // write
+      case 7: // write
         if ((h & 0x31) == 0) { // 1/4 chance to delete
           skipListErase(0, deleteValues_[t]);
         } else {
           skipListInsert(0, writeValues_[t]);
         }
-        return 0;
+        return false;
       default:
         return skipListFind(0, readValues_[t]);
     }
   }
 
-  bool accessSet(int64_t id, int t) {
+  bool accessSet(int64_t id, size_t t) {
     if (t > readValues_.size()) {
       t = t % readValues_.size();
     }
     uint32_t h = folly::hash::twang_32from64(t * id);
     int idx = (h % FLAGS_num_sets);
-    switch (h % 8) {  // 1/8 chance to write
-      case 7:   // write
+    switch (h % 8) { // 1/8 chance to write
+      case 7: // write
         if ((h & 0x31) == 0) { // 1/32 chance to delete
           setErase(idx, deleteValues_[t]);
         } else {
           setInsert(idx, writeValues_[t]);
         }
-        return 0;
+        return false;
       default:
         return setFind(idx, readValues_[t]);
     }
@@ -468,13 +480,12 @@ class ConcurrentAccessData {
   std::vector<ValueType> deleteValues_;
 };
 
-static std::map<int, boost::shared_ptr<ConcurrentAccessData> > g_data;
+static std::map<int, std::shared_ptr<ConcurrentAccessData>> g_data;
 
-static ConcurrentAccessData *mayInitTestData(int size) {
+static ConcurrentAccessData* mayInitTestData(int size) {
   auto it = g_data.find(size);
   if (it == g_data.end()) {
-    auto ptr = boost::shared_ptr<ConcurrentAccessData>(
-        new ConcurrentAccessData(size));
+    auto ptr = std::make_shared<ConcurrentAccessData>(size);
     g_data[size] = ptr;
     return ptr.get();
   }
@@ -488,12 +499,10 @@ void BM_ContentionCSL(int iters, int size) {
   susp.dismiss();
 
   for (int i = 0; i < FLAGS_num_threads; ++i) {
-    threads.push_back(std::thread(
-          &ConcurrentAccessData::runSkipList, data, i, iters));
+    threads.push_back(
+        std::thread(&ConcurrentAccessData::runSkipList, data, i, iters));
   }
-  FOR_EACH(t, threads) {
-    (*t).join();
-  }
+  FOR_EACH (t, threads) { (*t).join(); }
 }
 
 void BM_ContentionStdSet(int iters, int size) {
@@ -503,101 +512,95 @@ void BM_ContentionStdSet(int iters, int size) {
   susp.dismiss();
 
   for (int i = 0; i < FLAGS_num_threads; ++i) {
-    threads.push_back(std::thread(
-          &ConcurrentAccessData::runSet, data, i, iters));
+    threads.push_back(
+        std::thread(&ConcurrentAccessData::runSet, data, i, iters));
   }
-  FOR_EACH(t, threads) {
-    (*t).join();
-  }
+  FOR_EACH (t, threads) { (*t).join(); }
   susp.rehire();
 }
-
 
 // Single-thread benchmarking
 
 BENCHMARK_DRAW_LINE();
 
-BENCHMARK_PARAM(BM_IterateOverSet,  1000);
-BENCHMARK_PARAM(BM_IterateSkipList, 1000);
+BENCHMARK_PARAM(BM_IterateOverSet, 1000)
+BENCHMARK_PARAM(BM_IterateSkipList, 1000)
 BENCHMARK_DRAW_LINE();
-BENCHMARK_PARAM(BM_IterateOverSet,  1000000);
-BENCHMARK_PARAM(BM_IterateSkipList, 1000000);
+BENCHMARK_PARAM(BM_IterateOverSet, 1000000)
+BENCHMARK_PARAM(BM_IterateSkipList, 1000000)
 BENCHMARK_DRAW_LINE();
 
 // find with keys in the set
-BENCHMARK_PARAM(BM_SetContainsFound, 1000);
-BENCHMARK_PARAM(BM_CSLContainsFound, 1000);
+BENCHMARK_PARAM(BM_SetContainsFound, 1000)
+BENCHMARK_PARAM(BM_CSLContainsFound, 1000)
 BENCHMARK_DRAW_LINE();
-BENCHMARK_PARAM(BM_SetContainsFound, 100000);
-BENCHMARK_PARAM(BM_CSLContainsFound, 100000);
+BENCHMARK_PARAM(BM_SetContainsFound, 100000)
+BENCHMARK_PARAM(BM_CSLContainsFound, 100000)
 BENCHMARK_DRAW_LINE();
-BENCHMARK_PARAM(BM_SetContainsFound, 1000000);
-BENCHMARK_PARAM(BM_CSLContainsFound, 1000000);
+BENCHMARK_PARAM(BM_SetContainsFound, 1000000)
+BENCHMARK_PARAM(BM_CSLContainsFound, 1000000)
 BENCHMARK_DRAW_LINE();
-BENCHMARK_PARAM(BM_SetContainsFound, 10000000);
-BENCHMARK_PARAM(BM_CSLContainsFound, 10000000);
+BENCHMARK_PARAM(BM_SetContainsFound, 10000000)
+BENCHMARK_PARAM(BM_CSLContainsFound, 10000000)
 BENCHMARK_DRAW_LINE();
-
 
 // find with keys not in the set
-BENCHMARK_PARAM(BM_SetContainsNotFound, 1000);
-BENCHMARK_PARAM(BM_CSLContainsNotFound, 1000);
+BENCHMARK_PARAM(BM_SetContainsNotFound, 1000)
+BENCHMARK_PARAM(BM_CSLContainsNotFound, 1000)
 BENCHMARK_DRAW_LINE();
-BENCHMARK_PARAM(BM_SetContainsNotFound, 100000);
-BENCHMARK_PARAM(BM_CSLContainsNotFound, 100000);
+BENCHMARK_PARAM(BM_SetContainsNotFound, 100000)
+BENCHMARK_PARAM(BM_CSLContainsNotFound, 100000)
 BENCHMARK_DRAW_LINE();
-BENCHMARK_PARAM(BM_SetContainsNotFound, 1000000);
-BENCHMARK_PARAM(BM_CSLContainsNotFound, 1000000);
-BENCHMARK_DRAW_LINE();
-
-
-BENCHMARK_PARAM(BM_AddSet,      1000);
-BENCHMARK_PARAM(BM_AddSkipList, 1000);
+BENCHMARK_PARAM(BM_SetContainsNotFound, 1000000)
+BENCHMARK_PARAM(BM_CSLContainsNotFound, 1000000)
 BENCHMARK_DRAW_LINE();
 
-BENCHMARK_PARAM(BM_AddSet,      65536);
-BENCHMARK_PARAM(BM_AddSkipList, 65536);
+BENCHMARK_PARAM(BM_AddSet, 1000)
+BENCHMARK_PARAM(BM_AddSkipList, 1000)
 BENCHMARK_DRAW_LINE();
 
-BENCHMARK_PARAM(BM_AddSet,      1000000);
-BENCHMARK_PARAM(BM_AddSkipList, 1000000);
+BENCHMARK_PARAM(BM_AddSet, 65536)
+BENCHMARK_PARAM(BM_AddSkipList, 65536)
 BENCHMARK_DRAW_LINE();
 
-BENCHMARK_PARAM(BM_SetMerge,             1000);
-BENCHMARK_PARAM(BM_CSLMergeIntersection, 1000);
-BENCHMARK_PARAM(BM_CSLMergeLookup,       1000);
+BENCHMARK_PARAM(BM_AddSet, 1000000)
+BENCHMARK_PARAM(BM_AddSkipList, 1000000)
 BENCHMARK_DRAW_LINE();
 
-BENCHMARK_PARAM(BM_SetMerge,             65536);
-BENCHMARK_PARAM(BM_CSLMergeIntersection, 65536);
-BENCHMARK_PARAM(BM_CSLMergeLookup,       65536);
+BENCHMARK_PARAM(BM_SetMerge, 1000)
+BENCHMARK_PARAM(BM_CSLMergeIntersection, 1000)
+BENCHMARK_PARAM(BM_CSLMergeLookup, 1000)
 BENCHMARK_DRAW_LINE();
 
-BENCHMARK_PARAM(BM_SetMerge,             1000000);
-BENCHMARK_PARAM(BM_CSLMergeIntersection, 1000000);
-BENCHMARK_PARAM(BM_CSLMergeLookup,       1000000);
+BENCHMARK_PARAM(BM_SetMerge, 65536)
+BENCHMARK_PARAM(BM_CSLMergeIntersection, 65536)
+BENCHMARK_PARAM(BM_CSLMergeLookup, 65536)
 BENCHMARK_DRAW_LINE();
 
+BENCHMARK_PARAM(BM_SetMerge, 1000000)
+BENCHMARK_PARAM(BM_CSLMergeIntersection, 1000000)
+BENCHMARK_PARAM(BM_CSLMergeLookup, 1000000)
+BENCHMARK_DRAW_LINE();
 
 // multithreaded benchmarking
 
-BENCHMARK_PARAM(BM_ContentionStdSet, 1024);
-BENCHMARK_PARAM(BM_ContentionCSL,    1024);
+BENCHMARK_PARAM(BM_ContentionStdSet, 1024)
+BENCHMARK_PARAM(BM_ContentionCSL, 1024)
 BENCHMARK_DRAW_LINE();
 
-BENCHMARK_PARAM(BM_ContentionStdSet, 65536);
-BENCHMARK_PARAM(BM_ContentionCSL,    65536);
+BENCHMARK_PARAM(BM_ContentionStdSet, 65536)
+BENCHMARK_PARAM(BM_ContentionCSL, 65536)
 BENCHMARK_DRAW_LINE();
 
-BENCHMARK_PARAM(BM_ContentionStdSet, 1048576);
-BENCHMARK_PARAM(BM_ContentionCSL,    1048576);
+BENCHMARK_PARAM(BM_ContentionStdSet, 1048576)
+BENCHMARK_PARAM(BM_ContentionCSL, 1048576)
 BENCHMARK_DRAW_LINE();
 
-}
+} // namespace
 
 int main(int argc, char** argv) {
   google::InitGoogleLogging(argv[0]);
-  google::ParseCommandLineFlags(&argc, &argv, true);
+  gflags::ParseCommandLineFlags(&argc, &argv, true);
 
   initData();
   runBenchmarks();

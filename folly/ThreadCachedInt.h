@@ -1,5 +1,5 @@
 /*
- * Copyright 2013 Facebook, Inc.
+ * Copyright 2011-present Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -20,32 +20,32 @@
  * @author Spencer Ahrens (sahrens)
  */
 
-#ifndef FOLLY_THREADCACHEDINT_H
-#define FOLLY_THREADCACHEDINT_H
+#pragma once
 
 #include <atomic>
-#include "folly/Likely.h"
-#include "folly/ThreadLocal.h"
+
+#include <boost/noncopyable.hpp>
+
+#include <folly/Likely.h>
+#include <folly/ThreadLocal.h>
 
 namespace folly {
-
 
 // Note that readFull requires holding a lock and iterating through all of the
 // thread local objects with the same Tag, so if you have a lot of
 // ThreadCachedInt's you should considering breaking up the Tag space even
 // further.
-template <class IntT, class Tag=IntT>
+template <class IntT, class Tag = IntT>
 class ThreadCachedInt : boost::noncopyable {
   struct IntCache;
 
  public:
   explicit ThreadCachedInt(IntT initialVal = 0, uint32_t cacheSize = 1000)
-    : target_(initialVal), cacheSize_(cacheSize) {
-  }
+      : target_(initialVal), cacheSize_(cacheSize) {}
 
   void increment(IntT inc) {
     auto cache = cache_.get();
-    if (UNLIKELY(cache == NULL || cache->parent_ == NULL)) {
+    if (UNLIKELY(cache == nullptr)) {
       cache = new IntCache(*this);
       cache_.reset(cache);
     }
@@ -61,8 +61,11 @@ class ThreadCachedInt : boost::noncopyable {
   // Reads the current value plus all the cached increments.  Requires grabbing
   // a lock, so this is significantly slower than readFast().
   IntT readFull() const {
+    // This could race with thread destruction and so the access lock should be
+    // acquired before reading the current value
+    const auto accessor = cache_.accessAllThreads();
     IntT ret = readFast();
-    for (const auto& cache : cache_.accessAllThreads()) {
+    for (const auto& cache : accessor) {
       if (!cache.reset_.load(std::memory_order_acquire)) {
         ret += cache.val_.load(std::memory_order_relaxed);
       }
@@ -80,8 +83,11 @@ class ThreadCachedInt : boost::noncopyable {
   // little off, however, but it should be much better than calling readFull()
   // and set(0) sequentially.
   IntT readFullAndReset() {
+    // This could race with thread destruction and so the access lock should be
+    // acquired before reading the current value
+    auto accessor = cache_.accessAllThreads();
     IntT ret = readFastAndReset();
-    for (auto& cache : cache_.accessAllThreads()) {
+    for (auto& cache : accessor) {
       if (!cache.reset_.load(std::memory_order_acquire)) {
         ret += cache.val_.load(std::memory_order_relaxed);
         cache.reset_.store(true, std::memory_order_release);
@@ -98,11 +104,23 @@ class ThreadCachedInt : boost::noncopyable {
     return cacheSize_.load();
   }
 
-  ThreadCachedInt& operator+=(IntT inc) { increment(inc); return *this; }
-  ThreadCachedInt& operator-=(IntT inc) { increment(-inc); return *this; }
+  ThreadCachedInt& operator+=(IntT inc) {
+    increment(inc);
+    return *this;
+  }
+  ThreadCachedInt& operator-=(IntT inc) {
+    increment(-inc);
+    return *this;
+  }
   // pre-increment (we don't support post-increment)
-  ThreadCachedInt& operator++() { increment(1); return *this; }
-  ThreadCachedInt& operator--() { increment(-1); return *this; }
+  ThreadCachedInt& operator++() {
+    increment(1);
+    return *this;
+  }
+  ThreadCachedInt& operator--() {
+    increment(IntT(-1));
+    return *this;
+  }
 
   // Thread-safe set function.
   // This is a best effort implementation. In some edge cases, there could be
@@ -114,19 +132,11 @@ class ThreadCachedInt : boost::noncopyable {
     target_.store(newVal, std::memory_order_release);
   }
 
-  // This is a little tricky - it's possible that our IntCaches are still alive
-  // in another thread and will get destroyed after this destructor runs, so we
-  // need to make sure we signal that this parent is dead.
-  ~ThreadCachedInt() {
-    for (auto& cache : cache_.accessAllThreads()) {
-      cache.parent_ = NULL;
-    }
-  }
-
  private:
   std::atomic<IntT> target_;
   std::atomic<uint32_t> cacheSize_;
-  ThreadLocalPtr<IntCache,Tag> cache_; // Must be last for dtor ordering
+  ThreadLocalPtr<IntCache, Tag, AccessModeStrict>
+      cache_; // Must be last for dtor ordering
 
   // This should only ever be modified by one thread
   struct IntCache {
@@ -143,16 +153,16 @@ class ThreadCachedInt : boost::noncopyable {
         // This thread is the only writer to val_, so it's fine do do
         // a relaxed load and do the addition non-atomically.
         val_.store(
-          val_.load(std::memory_order_relaxed) + inc,
-          std::memory_order_release
-        );
+            val_.load(std::memory_order_relaxed) + inc,
+            std::memory_order_release);
       } else {
         val_.store(inc, std::memory_order_relaxed);
         reset_.store(false, std::memory_order_release);
       }
       ++numUpdates_;
-      if (UNLIKELY(numUpdates_ >
-                   parent_->cacheSize_.load(std::memory_order_acquire))) {
+      if (UNLIKELY(
+              numUpdates_ >
+              parent_->cacheSize_.load(std::memory_order_acquire))) {
         flush();
       }
     }
@@ -164,13 +174,9 @@ class ThreadCachedInt : boost::noncopyable {
     }
 
     ~IntCache() {
-      if (parent_) {
-        flush();
-      }
+      flush();
     }
   };
 };
 
-}
-
-#endif
+} // namespace folly

@@ -1,5 +1,5 @@
 /*
- * Copyright 2013 Facebook, Inc.
+ * Copyright 2012-present Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,8 +17,7 @@
 //
 // Exception tracer library.
 
-#ifndef FOLLY_EXPERIMENTAL_EXCEPTION_TRACER_EXCEPTIONTRACER_H_
-#define FOLLY_EXPERIMENTAL_EXCEPTION_TRACER_EXCEPTIONTRACER_H_
+#pragma once
 
 #include <cstdint>
 #include <iosfwd>
@@ -29,13 +28,17 @@ namespace folly {
 namespace exception_tracer {
 
 struct ExceptionInfo {
-  const std::type_info* type;
+  const std::type_info* type{nullptr};
   // The values in frames are IP (instruction pointer) addresses.
   // They are only filled if the low-level exception tracer library is
   // linked in or LD_PRELOADed.
-  std::vector<uintptr_t> frames;  // front() is top of stack
+  std::vector<uintptr_t> frames; // front() is top of stack
 };
 
+void printExceptionInfo(
+    std::ostream& out,
+    const ExceptionInfo& info,
+    int options);
 std::ostream& operator<<(std::ostream& out, const ExceptionInfo& info);
 
 /**
@@ -49,8 +52,5 @@ std::vector<ExceptionInfo> getCurrentExceptions();
  */
 void installHandlers();
 
-}  // namespace exception_tracer
-}  // namespace folly
-
-#endif /* FOLLY_EXPERIMENTAL_EXCEPTION_TRACER_EXCEPTIONTRACER_H_ */
-
+} // namespace exception_tracer
+} // namespace folly

@@ -1,5 +1,5 @@
 /*
- * Copyright 2013 Facebook, Inc.
+ * Copyright 2012-present Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,16 +17,17 @@
 // @author Bo Hu (bhu@fb.com)
 // @author Jordan DeLong (delong.j@fb.com)
 
-#ifndef PRODUCER_CONSUMER_QUEUE_H_
-#define PRODUCER_CONSUMER_QUEUE_H_
+#pragma once
 
 #include <atomic>
 #include <cassert>
 #include <cstdlib>
+#include <memory>
 #include <stdexcept>
 #include <type_traits>
 #include <utility>
-#include <boost/noncopyable.hpp>
+
+#include <folly/concurrency/CacheLocality.h>
 
 namespace folly {
 
@@ -34,9 +35,12 @@ namespace folly {
  * ProducerConsumerQueue is a one producer and one consumer queue
  * without locks.
  */
-template<class T>
-struct ProducerConsumerQueue : private boost::noncopyable {
+template <class T>
+struct ProducerConsumerQueue {
   typedef T value_type;
+
+  ProducerConsumerQueue(const ProducerConsumerQueue&) = delete;
+  ProducerConsumerQueue& operator=(const ProducerConsumerQueue&) = delete;
 
   // size must be >= 2.
   //
@@ -44,11 +48,10 @@ struct ProducerConsumerQueue : private boost::noncopyable {
   // given time is actually (size-1), so if you start with an empty queue,
   // isFull() will return true after size-1 insertions.
   explicit ProducerConsumerQueue(uint32_t size)
-    : size_(size)
-    , records_(static_cast<T*>(std::malloc(sizeof(T) * size)))
-    , readIndex_(0)
-    , writeIndex_(0)
-  {
+      : size_(size),
+        records_(static_cast<T*>(std::malloc(sizeof(T) * size))),
+        readIndex_(0),
+        writeIndex_(0) {
     assert(size >= 2);
     if (!records_) {
       throw std::bad_alloc();
@@ -59,13 +62,13 @@ struct ProducerConsumerQueue : private boost::noncopyable {
     // We need to destruct anything that may still exist in our queue.
     // (No real synchronization needed at destructor time: only one
     // thread can be doing this.)
-    if (!std::has_trivial_destructor<T>::value) {
-      int read = readIndex_;
-      int end = writeIndex_;
-      while (read != end) {
-        records_[read].~T();
-        if (++read == size_) {
-          read = 0;
+    if (!std::is_trivially_destructible<T>::value) {
+      size_t readIndex = readIndex_;
+      size_t endIndex = writeIndex_;
+      while (readIndex != endIndex) {
+        records_[readIndex].~T();
+        if (++readIndex == size_) {
+          readIndex = 0;
         }
       }
     }
@@ -73,7 +76,7 @@ struct ProducerConsumerQueue : private boost::noncopyable {
     std::free(records_);
   }
 
-  template<class ...Args>
+  template <class... Args>
   bool write(Args&&... recordArgs) {
     auto const currentWrite = writeIndex_.load(std::memory_order_relaxed);
     auto nextRecord = currentWrite + 1;
@@ -133,16 +136,16 @@ struct ProducerConsumerQueue : private boost::noncopyable {
   }
 
   bool isEmpty() const {
-   return readIndex_.load(std::memory_order_consume) ==
-         writeIndex_.load(std::memory_order_consume);
+    return readIndex_.load(std::memory_order_acquire) ==
+        writeIndex_.load(std::memory_order_acquire);
   }
 
   bool isFull() const {
-    auto nextRecord = writeIndex_.load(std::memory_order_consume) + 1;
+    auto nextRecord = writeIndex_.load(std::memory_order_acquire) + 1;
     if (nextRecord == size_) {
       nextRecord = 0;
     }
-    if (nextRecord != readIndex_.load(std::memory_order_consume)) {
+    if (nextRecord != readIndex_.load(std::memory_order_acquire)) {
       return false;
     }
     // queue is full
@@ -155,22 +158,30 @@ struct ProducerConsumerQueue : private boost::noncopyable {
   //   be removing items concurrently).
   // * It is undefined to call this from any other thread.
   size_t sizeGuess() const {
-    int ret = writeIndex_.load(std::memory_order_consume) -
-              readIndex_.load(std::memory_order_consume);
+    int ret = writeIndex_.load(std::memory_order_acquire) -
+        readIndex_.load(std::memory_order_acquire);
     if (ret < 0) {
       ret += size_;
     }
     return ret;
   }
 
-private:
+  // maximum number of items in the queue.
+  size_t capacity() const {
+    return size_ - 1;
+  }
+
+ private:
+  using AtomicIndex = std::atomic<unsigned int>;
+
+  char pad0_[hardware_destructive_interference_size];
   const uint32_t size_;
   T* const records_;
 
-  std::atomic<int> readIndex_;
-  std::atomic<int> writeIndex_;
+  alignas(hardware_destructive_interference_size) AtomicIndex readIndex_;
+  alignas(hardware_destructive_interference_size) AtomicIndex writeIndex_;
+
+  char pad1_[hardware_destructive_interference_size - sizeof(AtomicIndex)];
 };
 
-}
-
-#endif
+} // namespace folly

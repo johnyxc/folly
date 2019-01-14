@@ -1,5 +1,5 @@
 /*
- * Copyright 2013 Facebook, Inc.
+ * Copyright 2011-present Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,66 +14,121 @@
  * limitations under the License.
  */
 
-#include "folly/small_vector.h"
+#include <folly/small_vector.h>
+#include <folly/sorted_vector_types.h>
 
-#include <gtest/gtest.h>
-#include <string>
-#include <memory>
 #include <iostream>
+#include <iterator>
 #include <limits>
+#include <memory>
+#include <sstream>
+#include <string>
+#include <vector>
 
 #include <boost/algorithm/string.hpp>
 
-#include "folly/Conv.h"
+#include <folly/Conv.h>
+#include <folly/Traits.h>
+#include <folly/portability/GTest.h>
 
 using folly::small_vector;
 using namespace folly::small_vector_policy;
 
-#if defined(__x86_64__)
+#if FOLLY_X64 || FOLLY_PPC64
 
-static_assert(sizeof(small_vector<int>) == 16,
-              "Object size is not what we expect for small_vector<int>");
-static_assert(sizeof(small_vector<int32_t,2>) == 16,
-              "Object size is not what we expect for "
-              "small_vector<int32_t,2>");
-static_assert(sizeof(small_vector<int,10>) ==
-                10 * sizeof(int) + sizeof(std::size_t),
-              "Object size is not what we expect for small_vector<int,10>");
+static_assert(
+    sizeof(small_vector<int>) == 16,
+    "Object size is not what we expect for small_vector<int>");
+static_assert(
+    sizeof(small_vector<int32_t, 2>) == 16,
+    "Object size is not what we expect for "
+    "small_vector<int32_t,2>");
+static_assert(
+    sizeof(small_vector<int, 10>) == 10 * sizeof(int) + sizeof(std::size_t),
+    "Object size is not what we expect for small_vector<int,10>");
 
-static_assert(sizeof(small_vector<int32_t,1,uint32_t>) ==
-                8 + 4,
-              "small_vector<int32_t,1,uint32_t> is wrong size");
-static_assert(sizeof(small_vector<int32_t,1,uint16_t>) ==
-                8 + 2,
-              "small_vector<int32_t,1,uint32_t> is wrong size");
-static_assert(sizeof(small_vector<int32_t,1,uint8_t>) ==
-                8 + 1,
-              "small_vector<int32_t,1,uint32_t> is wrong size");
+static_assert(
+    sizeof(small_vector<int32_t, 1, uint32_t>) == 8 + 4,
+    "small_vector<int32_t,1,uint32_t> is wrong size");
 
-static_assert(sizeof(small_vector<int32_t,1,OneBitMutex>) == 16,
-              "OneBitMutex took more space than expected");
+// Extra 2 bytes needed for alignment.
+static_assert(
+    sizeof(small_vector<int32_t, 1, uint16_t>) == 8 + 2 + 2,
+    "small_vector<int32_t,1,uint16_t> is wrong size");
+static_assert(
+    alignof(small_vector<int32_t, 1, uint16_t>) >= 4,
+    "small_vector not aligned correctly");
 
-static_assert(sizeof(small_vector<int16_t,4,uint16_t>) == 10,
-              "Sizeof unexpectedly large");
-static_assert(sizeof(small_vector<int16_t,4,uint16_t,OneBitMutex>) == 10,
-              "Sizeof unexpectedly large");
-static_assert(sizeof(small_vector<int16_t,4,NoHeap,uint16_t,
-                                  OneBitMutex>) == 10,
-              "Sizeof unexpectedly large");
+// Extra 3 bytes needed for alignment.
+static_assert(
+    sizeof(small_vector<int32_t, 1, uint8_t>) == 8 + 1 + 3,
+    "small_vector<int32_t,1,uint8_t> is wrong size");
+static_assert(
+    alignof(small_vector<int32_t, 1, uint8_t>) >= 4,
+    "small_vector not aligned correctly");
+
+static_assert(
+    sizeof(small_vector<int16_t, 4, uint16_t>) == 10,
+    "Sizeof unexpectedly large");
 
 #endif
 
+static_assert(
+    !folly::is_trivially_copyable<std::unique_ptr<int>>::value,
+    "std::unique_ptr<> is trivially copyable");
+
+static_assert(
+    alignof(small_vector<std::aligned_storage<32, 32>::type, 4>) == 32,
+    "small_vector not aligned correctly");
+
 namespace {
+
+template <typename Key, typename Value, size_t N>
+using small_sorted_vector_map = folly::sorted_vector_map<
+    Key,
+    Value,
+    std::less<Key>,
+    std::allocator<std::pair<Key, Value>>,
+    void,
+    folly::small_vector<std::pair<Key, Value>, N>>;
+
+template <typename Key, typename Value, size_t N>
+using noheap_sorted_vector_map = folly::sorted_vector_map<
+    Key,
+    Value,
+    std::less<Key>,
+    std::allocator<std::pair<Key, Value>>,
+    void,
+    folly::small_vector<
+        std::pair<Key, Value>,
+        N,
+        folly::small_vector_policy::NoHeap>>;
+
+template <typename T, size_t N>
+using small_sorted_vector_set = folly::sorted_vector_set<
+    T,
+    std::less<T>,
+    std::allocator<T>,
+    void,
+    folly::small_vector<T, N>>;
+
+template <typename T, size_t N>
+using noheap_sorted_vector_set = folly::sorted_vector_set<
+    T,
+    std::less<T>,
+    std::allocator<T>,
+    void,
+    folly::small_vector<T, N, folly::small_vector_policy::NoHeap>>;
 
 struct NontrivialType {
   static int ctored;
   explicit NontrivialType() : a(0) {}
 
-  /* implicit */ NontrivialType(int a) : a(a) {
+  /* implicit */ NontrivialType(int a_) : a(a_) {
     ++ctored;
   }
 
-  NontrivialType(NontrivialType const& s) {
+  NontrivialType(NontrivialType const& /* s */) {
     ++ctored;
   }
 
@@ -84,8 +139,9 @@ struct NontrivialType {
 
   int32_t a;
 };
-static_assert(!boost::has_trivial_copy<NontrivialType>::value,
-              "NontrivialType isn't trivially copyable");
+static_assert(
+    !folly::is_trivially_copyable<NontrivialType>::value,
+    "NontrivialType is trivially copyable");
 
 int NontrivialType::ctored = 0;
 
@@ -118,7 +174,7 @@ struct Thrower {
     --alive;
   }
 
-  Thrower& operator=(Thrower const& other) {
+  Thrower& operator=(Thrower const& /* other */) {
     EXPECT_EQ(magic, kMagic);
     MaybeThrow();
     return *this;
@@ -141,27 +197,33 @@ struct NoncopyableCounter {
   ~NoncopyableCounter() {
     --alive;
   }
-  NoncopyableCounter(NoncopyableCounter&&) { ++alive; }
+  NoncopyableCounter(NoncopyableCounter&&) noexcept {
+    ++alive;
+  }
   NoncopyableCounter(NoncopyableCounter const&) = delete;
   NoncopyableCounter& operator=(NoncopyableCounter const&) const = delete;
-  NoncopyableCounter& operator=(NoncopyableCounter&&) { return *this; }
+  NoncopyableCounter& operator=(NoncopyableCounter&&) {
+    return *this;
+  }
 };
 int NoncopyableCounter::alive = 0;
+
+static_assert(
+    !folly::is_trivially_copyable<NoncopyableCounter>::value,
+    "NoncopyableCounter is trivially copyable");
 
 // Check that throws don't break the basic guarantee for some cases.
 // Uses the method for testing exception safety described at
 // http://www.boost.org/community/exception_safety.html, to force all
 // throwing code paths to occur.
 struct TestBasicGuarantee {
-  folly::small_vector<Thrower,3> vec;
+  folly::small_vector<Thrower, 3> vec;
   int const prepopulate;
 
-  explicit TestBasicGuarantee(int prepopulate)
-    : prepopulate(prepopulate)
-  {
+  explicit TestBasicGuarantee(int prepopulate_) : prepopulate(prepopulate_) {
     throwCounter = 1000;
     for (int i = 0; i < prepopulate; ++i) {
-      vec.push_back(Thrower());
+      vec.emplace_back();
     }
   }
 
@@ -169,14 +231,14 @@ struct TestBasicGuarantee {
     throwCounter = 1000;
   }
 
-  template<class Operation>
+  template <class Operation>
   void operator()(int insertCount, Operation const& op) {
     bool done = false;
 
-    std::unique_ptr<folly::small_vector<Thrower,3> > workingVec;
+    std::unique_ptr<folly::small_vector<Thrower, 3>> workingVec;
     for (int counter = 1; !done; ++counter) {
       throwCounter = 1000;
-      workingVec.reset(new folly::small_vector<Thrower,3>(vec));
+      workingVec = std::make_unique<folly::small_vector<Thrower, 3>>(vec);
       throwCounter = counter;
       EXPECT_EQ(Thrower::alive, prepopulate * 2);
       try {
@@ -198,72 +260,57 @@ struct TestBasicGuarantee {
   }
 };
 
-}
+} // namespace
 
 TEST(small_vector, BasicGuarantee) {
   for (int prepop = 1; prepop < 30; ++prepop) {
     (TestBasicGuarantee(prepop))( // parens or a mildly vexing parse :(
-      1,
-      [&] (folly::small_vector<Thrower,3>& v) {
-        v.push_back(Thrower());
-      }
-    );
+        1,
+        [&](folly::small_vector<Thrower, 3>& v) { v.emplace_back(); });
 
     EXPECT_EQ(Thrower::alive, 0);
 
-    (TestBasicGuarantee(prepop))(
-      1,
-      [&] (folly::small_vector<Thrower,3>& v) {
-        v.insert(v.begin(), Thrower());
-      }
-    );
+    (TestBasicGuarantee(prepop))(1, [&](folly::small_vector<Thrower, 3>& v) {
+      v.insert(v.begin(), Thrower());
+    });
 
     EXPECT_EQ(Thrower::alive, 0);
 
-    (TestBasicGuarantee(prepop))(
-      1,
-      [&] (folly::small_vector<Thrower,3>& v) {
-        v.insert(v.begin() + 1, Thrower());
-      }
-    );
+    (TestBasicGuarantee(prepop))(1, [&](folly::small_vector<Thrower, 3>& v) {
+      v.insert(v.begin() + 1, Thrower());
+    });
 
     EXPECT_EQ(Thrower::alive, 0);
   }
 
-  TestBasicGuarantee(4)(
-    3,
-    [&] (folly::small_vector<Thrower,3>& v) {
-      std::vector<Thrower> b;
-      b.push_back(Thrower());
-      b.push_back(Thrower());
-      b.push_back(Thrower());
+  TestBasicGuarantee(4)(3, [&](folly::small_vector<Thrower, 3>& v) {
+    std::vector<Thrower> b;
+    b.emplace_back();
+    b.emplace_back();
+    b.emplace_back();
 
-      /*
-       * Apparently if you do the following initializer_list instead
-       * of the above push_back's, and one of the Throwers throws,
-       * g++4.6 doesn't destruct the previous ones.  Heh.
-       */
-      //b = { Thrower(), Thrower(), Thrower() };
-      v.insert(v.begin() + 1, b.begin(), b.end());
+    /*
+     * Apparently if you do the following initializer_list instead
+     * of the above push_back's, and one of the Throwers throws,
+     * g++4.6 doesn't destruct the previous ones.  Heh.
+     */
+    // b = { Thrower(), Thrower(), Thrower() };
+    v.insert(v.begin() + 1, b.begin(), b.end());
+  });
+
+  TestBasicGuarantee(2)(6, [&](folly::small_vector<Thrower, 3>& v) {
+    std::vector<Thrower> b;
+    for (int i = 0; i < 6; ++i) {
+      b.emplace_back();
     }
-  );
 
-  TestBasicGuarantee(2)(
-    6,
-    [&] (folly::small_vector<Thrower,3>& v) {
-      std::vector<Thrower> b;
-      for (int i = 0; i < 6; ++i) {
-        b.push_back(Thrower());
-      }
-
-      v.insert(v.begin() + 1, b.begin(), b.end());
-    }
-  );
+    v.insert(v.begin() + 1, b.begin(), b.end());
+  });
 
   EXPECT_EQ(Thrower::alive, 0);
   try {
     throwCounter = 4;
-    folly::small_vector<Thrower,1> p(14, Thrower());
+    folly::small_vector<Thrower, 1> p(14, Thrower());
   } catch (...) {
   }
   EXPECT_EQ(Thrower::alive, 0);
@@ -271,7 +318,7 @@ TEST(small_vector, BasicGuarantee) {
 
 // Run this with.
 // MALLOC_CONF=prof_leak:true
-// LD_PRELOAD=${JEMALLOC_PATH}/lib/libjemalloc.so.1
+// LD_PRELOAD=${JEMALLOC_PATH}/lib/libjemalloc.so.2
 // LD_PRELOAD="$LD_PRELOAD:"${UNWIND_PATH}/lib/libunwind.so.7
 TEST(small_vector, leak_test) {
   for (int j = 0; j < 1000; ++j) {
@@ -286,7 +333,7 @@ TEST(small_vector, Insert) {
   folly::small_vector<int> someVec(3, 3);
   someVec.insert(someVec.begin(), 12, 12);
   EXPECT_EQ(someVec.size(), 15);
-  for (int i = 0; i < someVec.size(); ++i) {
+  for (size_t i = 0; i < someVec.size(); ++i) {
     if (i < 12) {
       EXPECT_EQ(someVec[i], 12);
     } else {
@@ -306,7 +353,7 @@ TEST(small_vector, Insert) {
 }
 
 TEST(small_vector, Swap) {
-  folly::small_vector<int,10> somethingVec, emptyVec;
+  folly::small_vector<int, 10> somethingVec, emptyVec;
   somethingVec.push_back(1);
   somethingVec.push_back(2);
   somethingVec.push_back(3);
@@ -319,7 +366,7 @@ TEST(small_vector, Swap) {
   EXPECT_FALSE(somethingVec == emptyVec);
 
   // Swapping a heap vector with an intern vector.
-  folly::small_vector<int,10> junkVec;
+  folly::small_vector<int, 10> junkVec;
   junkVec.assign(12, 12);
   EXPECT_EQ(junkVec.size(), 12);
   for (auto i : junkVec) {
@@ -333,7 +380,7 @@ TEST(small_vector, Swap) {
   }
 
   // Swapping two heap vectors.
-  folly::small_vector<int,10> moreJunk(15, 15);
+  folly::small_vector<int, 10> moreJunk(15, 15);
   EXPECT_EQ(moreJunk.size(), 15);
   for (auto i : moreJunk) {
     EXPECT_EQ(i, 15);
@@ -350,14 +397,14 @@ TEST(small_vector, Swap) {
 
   // Making a vector heap, then smaller than another non-heap vector,
   // then swapping.
-  folly::small_vector<int,5> shrinker, other(4, 10);
-  shrinker = { 0, 1, 2, 3, 4, 5, 6, 7, 8 };
+  folly::small_vector<int, 5> shrinker, other(4, 10);
+  shrinker = {0, 1, 2, 3, 4, 5, 6, 7, 8};
   shrinker.erase(shrinker.begin() + 2, shrinker.end());
   EXPECT_LT(shrinker.size(), other.size());
   swap(shrinker, other);
   EXPECT_EQ(shrinker.size(), 4);
   EXPECT_TRUE(boost::all(shrinker, boost::is_any_of(std::vector<int>{10})));
-  EXPECT_TRUE((other == small_vector<int,5>{ 0, 1 }));
+  EXPECT_TRUE((other == small_vector<int, 5>{0, 1}));
 }
 
 TEST(small_vector, Emplace) {
@@ -390,7 +437,7 @@ TEST(small_vector, Emplace) {
 }
 
 TEST(small_vector, Erase) {
-  folly::small_vector<int,4> notherVec = { 1, 2, 3, 4, 5 };
+  folly::small_vector<int, 4> notherVec = {1, 2, 3, 4, 5};
   EXPECT_EQ(notherVec.front(), 1);
   EXPECT_EQ(notherVec.size(), 5);
   notherVec.erase(notherVec.begin());
@@ -402,12 +449,12 @@ TEST(small_vector, Erase) {
   EXPECT_EQ(notherVec.size(), 3);
   EXPECT_EQ(notherVec[2], 5);
 
-  folly::small_vector<int,2> vec2 = { 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 };
+  folly::small_vector<int, 2> vec2 = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10};
   vec2.erase(vec2.begin() + 1, vec2.end() - 1);
-  folly::small_vector<int,2> expected = { 1, 10 };
+  folly::small_vector<int, 2> expected = {1, 10};
   EXPECT_TRUE(vec2 == expected);
 
-  folly::small_vector<std::string,3> v(102, "ASD");
+  folly::small_vector<std::string, 3> v(102, "ASD");
   v.resize(1024, "D");
   EXPECT_EQ(v.size(), 1024);
   EXPECT_EQ(v.back(), "D");
@@ -420,13 +467,13 @@ TEST(small_vector, Erase) {
 }
 
 TEST(small_vector, GrowShrinkGrow) {
-  folly::small_vector<NontrivialType,7> vec = { 1, 2, 3, 4, 5 };
+  folly::small_vector<NontrivialType, 7> vec = {1, 2, 3, 4, 5};
   std::generate_n(std::back_inserter(vec), 102, std::rand);
 
   auto capacity = vec.capacity();
 
   auto oldSize = vec.size();
-  for (int i = 0; i < oldSize; ++i) {
+  for (size_t i = 0; i < oldSize; ++i) {
     vec.erase(vec.begin() + (std::rand() % vec.size()));
     EXPECT_EQ(vec.capacity(), capacity);
   }
@@ -448,7 +495,7 @@ TEST(small_vector, GrowShrinkGrow) {
 }
 
 TEST(small_vector, Iteration) {
-  folly::small_vector<std::string,3> vec = { "foo", "bar" };
+  folly::small_vector<std::string, 3> vec = {"foo", "bar"};
   vec.push_back("blah");
   vec.push_back("blah2");
   vec.push_back("blah3");
@@ -472,9 +519,10 @@ TEST(small_vector, Iteration) {
 }
 
 TEST(small_vector, NonCopyableType) {
-  folly::small_vector<std::unique_ptr<std::string>,2> vec;
+  folly::small_vector<NontrivialType, 2> vec;
+
   for (int i = 0; i < 10; ++i) {
-    vec.emplace(vec.begin(), new std::string("asd"));
+    vec.emplace(vec.begin(), 13);
   }
   EXPECT_EQ(vec.size(), 10);
   auto vec2 = std::move(vec);
@@ -482,7 +530,7 @@ TEST(small_vector, NonCopyableType) {
   EXPECT_EQ(vec2.size(), 10);
   vec2.clear();
 
-  folly::small_vector<NoncopyableCounter,3> vec3;
+  folly::small_vector<NoncopyableCounter, 3> vec3;
   for (int i = 0; i < 10; ++i) {
     EXPECT_EQ(vec3.size(), i);
     EXPECT_EQ(NoncopyableCounter::alive, i);
@@ -503,7 +551,7 @@ TEST(small_vector, NonCopyableType) {
 }
 
 TEST(small_vector, MoveConstructor) {
-  folly::small_vector<std::string,10> v1;
+  folly::small_vector<std::string, 10> v1;
   v1.push_back("asd");
   v1.push_back("bsd");
   auto v2 = std::move(v1);
@@ -518,11 +566,15 @@ TEST(small_vector, MoveConstructor) {
 }
 
 TEST(small_vector, NoHeap) {
-  typedef folly::small_vector<std::string,10,
-    std::size_t,folly::small_vector_policy::NoHeap> Vector;
+  typedef folly::small_vector<
+      std::string,
+      10,
+      std::size_t,
+      folly::small_vector_policy::NoHeap>
+      Vector;
 
   Vector v;
-  EXPECT_EQ(v.max_size(), 10);
+  static_assert(v.max_size() == 10, "max_size is incorrect");
 
   for (int i = 0; i < 10; ++i) {
     v.push_back(folly::to<std::string>(i));
@@ -538,11 +590,7 @@ TEST(small_vector, NoHeap) {
   EXPECT_TRUE(caught);
 
   // Check max_size works right with various policy combinations.
-  folly::small_vector<std::string,32,uint32_t,NoHeap,OneBitMutex> v2;
-  EXPECT_EQ(v2.max_size(), 32);
-  folly::small_vector<std::string,32,uint32_t,OneBitMutex> v3;
-  EXPECT_EQ(v3.max_size(), (1ul << 30) - 1);
-  folly::small_vector<std::string,32,uint32_t> v4;
+  folly::small_vector<std::string, 32, uint32_t> v4;
   EXPECT_EQ(v4.max_size(), (1ul << 31) - 1);
 
   /*
@@ -550,8 +598,9 @@ TEST(small_vector, NoHeap) {
    * inline at least as much as it takes to store the value_type
    * pointer.
    */
-  folly::small_vector<char,1,NoHeap> notsosmall;
-  EXPECT_EQ(notsosmall.max_size(), sizeof(char*));
+  folly::small_vector<char, 1, NoHeap> notsosmall;
+  static_assert(
+      notsosmall.max_size() == sizeof(char*), "max_size is incorrect");
   caught = false;
   try {
     notsosmall.push_back(12);
@@ -564,47 +613,37 @@ TEST(small_vector, NoHeap) {
 }
 
 TEST(small_vector, MaxSize) {
-  folly::small_vector<int,2,uint8_t> vec;
+  folly::small_vector<int, 2, uint8_t> vec;
   EXPECT_EQ(vec.max_size(), 127);
-  folly::small_vector<int,2,uint16_t> vec2;
+  folly::small_vector<int, 2, uint16_t> vec2;
   EXPECT_EQ(vec2.max_size(), (1 << 15) - 1);
-  folly::small_vector<int,2,uint16_t,OneBitMutex> vec3;
-  EXPECT_EQ(vec3.max_size(), (1 << 14) - 1);
 }
 
 TEST(small_vector, AllHeap) {
   // Use something bigger than the pointer so it can't get inlined.
   struct SomeObj {
-    double a, b, c, d, e; int val;
-    SomeObj(int val) : val(val) {}
+    double a, b, c, d, e;
+    int val;
+    SomeObj(int val_) : val(val_) {}
     bool operator==(SomeObj const& o) const {
       return o.val == val;
     }
   };
 
-  folly::small_vector<SomeObj,0> vec = { 1 };
+  folly::small_vector<SomeObj, 0> vec = {1};
   EXPECT_EQ(vec.size(), 1);
   if (!vec.empty()) {
     EXPECT_TRUE(vec[0] == 1);
   }
-  vec.insert(vec.begin(), { 0, 1, 2, 3 });
+  vec.insert(vec.begin(), {0, 1, 2, 3});
   EXPECT_EQ(vec.size(), 5);
-  EXPECT_TRUE((vec == folly::small_vector<SomeObj,0>{ 0, 1, 2, 3, 1 }));
+  EXPECT_TRUE((vec == folly::small_vector<SomeObj, 0>{0, 1, 2, 3, 1}));
 }
 
 TEST(small_vector, Basic) {
-  typedef folly::small_vector<int,3,uint32_t
-#ifdef __x86_64__
-    ,OneBitMutex
-#endif
-  > Vector;
+  typedef folly::small_vector<int, 3, uint32_t> Vector;
 
   Vector a;
-
-#ifdef __x86_64__
-  a.lock();
-  a.unlock();
-#endif
 
   a.push_back(12);
   EXPECT_EQ(a.front(), 12);
@@ -646,7 +685,7 @@ TEST(small_vector, Basic) {
 }
 
 TEST(small_vector, Capacity) {
-  folly::small_vector<unsigned long, 1> vec;
+  folly::small_vector<uint64_t, 1> vec;
   EXPECT_EQ(vec.size(), 0);
   EXPECT_EQ(vec.capacity(), 1);
 
@@ -658,8 +697,7 @@ TEST(small_vector, Capacity) {
   EXPECT_EQ(vec.size(), 2);
   EXPECT_GT(vec.capacity(), 1);
 
-
-  folly::small_vector<unsigned long, 2> vec2;
+  folly::small_vector<uint64_t, 2> vec2;
   EXPECT_EQ(vec2.size(), 0);
   EXPECT_EQ(vec2.capacity(), 2);
 
@@ -672,12 +710,9 @@ TEST(small_vector, Capacity) {
   EXPECT_EQ(vec2.size(), 3);
   EXPECT_GT(vec2.capacity(), 2);
 
-  // Both have grown by the minimum amount
-  EXPECT_EQ(vec.capacity(), vec2.capacity());
-
   // Test capacity heapifying logic
   folly::small_vector<unsigned char, 1> vec3;
-  const size_t hc_size = 1000000;
+  const size_t hc_size = 100000;
   for (size_t i = 0; i < hc_size; ++i) {
     auto v = (unsigned char)i;
     vec3.push_back(v);
@@ -743,10 +778,340 @@ TEST(small_vector, SelfInsert) {
       vec.push_back("abc");
     }
     EXPECT_EQ(vec.size(), i);
-    vec.insert(vec.end()-1, std::move(vec[0]));
+    vec.insert(vec.end() - 1, std::move(vec[0]));
     EXPECT_EQ(vec.size(), i + 1);
 
-    EXPECT_EQ(vec[i-1], "abc");
+    EXPECT_EQ(vec[i - 1], "abc");
     EXPECT_EQ(vec[i], "abc");
   }
+}
+
+struct CheckedInt {
+  static const int DEFAULT_VALUE = (int)0xdeadbeef;
+  CheckedInt() : value(DEFAULT_VALUE) {}
+  explicit CheckedInt(int value_) : value(value_) {}
+  CheckedInt(const CheckedInt& rhs, int) : value(rhs.value) {}
+  CheckedInt(const CheckedInt& rhs) : value(rhs.value) {}
+  CheckedInt(CheckedInt&& rhs) noexcept : value(rhs.value) {
+    rhs.value = DEFAULT_VALUE;
+  }
+  CheckedInt& operator=(const CheckedInt& rhs) {
+    value = rhs.value;
+    return *this;
+  }
+  CheckedInt& operator=(CheckedInt&& rhs) noexcept {
+    value = rhs.value;
+    rhs.value = DEFAULT_VALUE;
+    return *this;
+  }
+  ~CheckedInt() {}
+  int value;
+};
+
+TEST(small_vector, ForwardingEmplaceInsideVector) {
+  folly::small_vector<CheckedInt> v;
+  v.push_back(CheckedInt(1));
+  for (int i = 1; i < 20; ++i) {
+    v.emplace_back(v[0], 42);
+    ASSERT_EQ(1, v.back().value);
+  }
+}
+
+TEST(small_vector, LVEmplaceInsideVector) {
+  folly::small_vector<CheckedInt> v;
+  v.push_back(CheckedInt(1));
+  for (int i = 1; i < 20; ++i) {
+    v.emplace_back(v[0]);
+    ASSERT_EQ(1, v.back().value);
+  }
+}
+
+TEST(small_vector, CLVEmplaceInsideVector) {
+  folly::small_vector<CheckedInt> v;
+  const folly::small_vector<CheckedInt>& cv = v;
+  v.push_back(CheckedInt(1));
+  for (int i = 1; i < 20; ++i) {
+    v.emplace_back(cv[0]);
+    ASSERT_EQ(1, v.back().value);
+  }
+}
+
+TEST(small_vector, RVEmplaceInsideVector) {
+  folly::small_vector<CheckedInt> v;
+  v.push_back(CheckedInt(0));
+  for (int i = 1; i < 20; ++i) {
+    v[0] = CheckedInt(1);
+    v.emplace_back(std::move(v[0]));
+    ASSERT_EQ(1, v.back().value);
+  }
+}
+
+TEST(small_vector, LVPushValueInsideVector) {
+  folly::small_vector<CheckedInt> v;
+  v.push_back(CheckedInt(1));
+  for (int i = 1; i < 20; ++i) {
+    v.push_back(v[0]);
+    ASSERT_EQ(1, v.back().value);
+  }
+}
+
+TEST(small_vector, RVPushValueInsideVector) {
+  folly::small_vector<CheckedInt> v;
+  v.push_back(CheckedInt(0));
+  for (int i = 1; i < 20; ++i) {
+    v[0] = CheckedInt(1);
+    v.push_back(v[0]);
+    ASSERT_EQ(1, v.back().value);
+  }
+}
+
+TEST(small_vector, EmplaceIterCtor) {
+  std::vector<int*> v{new int(1), new int(2)};
+  std::vector<std::unique_ptr<int>> uv(v.begin(), v.end());
+
+  std::vector<int*> w{new int(1), new int(2)};
+  small_vector<std::unique_ptr<int>> uw(w.begin(), w.end());
+}
+
+TEST(small_vector, InputIterator) {
+  std::vector<int> expected{125, 320, 512, 750, 333};
+  std::string values = "125 320 512 750 333";
+  std::istringstream is1(values);
+  std::istringstream is2(values);
+
+  std::vector<int> stdV{std::istream_iterator<int>(is1),
+                        std::istream_iterator<int>()};
+  ASSERT_EQ(stdV.size(), expected.size());
+  for (size_t i = 0; i < expected.size(); i++) {
+    ASSERT_EQ(stdV[i], expected[i]);
+  }
+
+  small_vector<int> smallV{std::istream_iterator<int>(is2),
+                           std::istream_iterator<int>()};
+  ASSERT_EQ(smallV.size(), expected.size());
+  for (size_t i = 0; i < expected.size(); i++) {
+    ASSERT_EQ(smallV[i], expected[i]);
+  }
+}
+
+TEST(small_vector, NoCopyCtor) {
+  struct Tester {
+    Tester() = default;
+    Tester(const Tester&) = delete;
+    Tester(Tester&&) = default;
+
+    int field = 42;
+  };
+
+  small_vector<Tester> test(10);
+  ASSERT_EQ(test.size(), 10);
+  for (const auto& element : test) {
+    EXPECT_EQ(element.field, 42);
+  }
+}
+
+TEST(small_vector, ZeroInitializable) {
+  small_vector<int> test(10);
+  ASSERT_EQ(test.size(), 10);
+  for (const auto& element : test) {
+    EXPECT_EQ(element, 0);
+  }
+}
+
+TEST(small_vector, InsertMoreThanGrowth) {
+  small_vector<int, 10> test;
+  test.insert(test.end(), 30, 0);
+  for (auto element : test) {
+    EXPECT_EQ(element, 0);
+  }
+}
+
+TEST(small_vector, EmplaceBackExponentialGrowth) {
+  small_vector<std::pair<int, int>> test;
+  std::vector<size_t> capacities;
+  capacities.push_back(test.capacity());
+  for (int i = 0; i < 10000; ++i) {
+    test.emplace_back(0, 0);
+    if (test.capacity() != capacities.back()) {
+      capacities.push_back(test.capacity());
+    }
+  }
+  EXPECT_LE(capacities.size(), 25);
+}
+
+TEST(small_vector, InsertExponentialGrowth) {
+  small_vector<std::pair<int, int>> test;
+  std::vector<size_t> capacities;
+  capacities.push_back(test.capacity());
+  for (int i = 0; i < 10000; ++i) {
+    test.insert(test.begin(), std::make_pair(0, 0));
+    if (test.capacity() != capacities.back()) {
+      capacities.push_back(test.capacity());
+    }
+  }
+  EXPECT_LE(capacities.size(), 25);
+}
+
+TEST(small_vector, InsertNExponentialGrowth) {
+  small_vector<int> test;
+  std::vector<size_t> capacities;
+  capacities.push_back(test.capacity());
+  for (int i = 0; i < 10000; ++i) {
+    test.insert(test.begin(), 100, 0);
+    if (test.capacity() != capacities.back()) {
+      capacities.push_back(test.capacity());
+    }
+  }
+  EXPECT_LE(capacities.size(), 25);
+}
+
+namespace {
+struct Counts {
+  size_t copyCount{0};
+  size_t moveCount{0};
+};
+
+class Counter {
+  Counts* counts;
+
+ public:
+  explicit Counter(Counts& counts_) : counts(&counts_) {}
+  Counter(Counter const& other) noexcept : counts(other.counts) {
+    ++counts->copyCount;
+  }
+  Counter(Counter&& other) noexcept : counts(other.counts) {
+    ++counts->moveCount;
+  }
+  Counter& operator=(Counter const& rhs) noexcept {
+    EXPECT_EQ(counts, rhs.counts);
+    ++counts->copyCount;
+    return *this;
+  }
+  Counter& operator=(Counter&& rhs) noexcept {
+    EXPECT_EQ(counts, rhs.counts);
+    ++counts->moveCount;
+    return *this;
+  }
+};
+} // namespace
+
+TEST(small_vector, EmplaceBackEfficiency) {
+  small_vector<Counter, 2> test;
+  Counts counts;
+  for (size_t i = 1; i <= test.capacity(); ++i) {
+    test.emplace_back(counts);
+    EXPECT_EQ(0, counts.copyCount);
+    EXPECT_EQ(0, counts.moveCount);
+  }
+  EXPECT_EQ(test.size(), test.capacity());
+  test.emplace_back(counts);
+  // Every element except the last has to be moved to the new position
+  EXPECT_EQ(0, counts.copyCount);
+  EXPECT_EQ(test.size() - 1, counts.moveCount);
+  EXPECT_LT(test.size(), test.capacity());
+}
+
+TEST(small_vector, RVPushBackEfficiency) {
+  small_vector<Counter, 2> test;
+  Counts counts;
+  for (size_t i = 1; i <= test.capacity(); ++i) {
+    test.push_back(Counter(counts));
+    // 1 copy for each push_back()
+    EXPECT_EQ(0, counts.copyCount);
+    EXPECT_EQ(i, counts.moveCount);
+  }
+  EXPECT_EQ(test.size(), test.capacity());
+  test.push_back(Counter(counts));
+  // 1 move for each push_back()
+  // Every element except the last has to be moved to the new position
+  EXPECT_EQ(0, counts.copyCount);
+  EXPECT_EQ(test.size() + test.size() - 1, counts.moveCount);
+  EXPECT_LT(test.size(), test.capacity());
+}
+
+TEST(small_vector, CLVPushBackEfficiency) {
+  small_vector<Counter, 2> test;
+  Counts counts;
+  Counter const counter(counts);
+  for (size_t i = 1; i <= test.capacity(); ++i) {
+    test.push_back(counter);
+    // 1 copy for each push_back()
+    EXPECT_EQ(i, counts.copyCount);
+    EXPECT_EQ(0, counts.moveCount);
+  }
+  EXPECT_EQ(test.size(), test.capacity());
+  test.push_back(counter);
+  // 1 copy for each push_back()
+  EXPECT_EQ(test.size(), counts.copyCount);
+  // Every element except the last has to be moved to the new position
+  EXPECT_EQ(test.size() - 1, counts.moveCount);
+  EXPECT_LT(test.size(), test.capacity());
+}
+
+TEST(small_vector, StorageForSortedVectorMap) {
+  small_sorted_vector_map<int32_t, int32_t, 2> test;
+  test.insert(std::make_pair(10, 10));
+  EXPECT_EQ(test.size(), 1);
+  test.insert(std::make_pair(10, 10));
+  EXPECT_EQ(test.size(), 1);
+  test.insert(std::make_pair(20, 10));
+  EXPECT_EQ(test.size(), 2);
+  test.insert(std::make_pair(30, 10));
+  EXPECT_EQ(test.size(), 3);
+}
+
+TEST(small_vector, NoHeapStorageForSortedVectorMap) {
+  noheap_sorted_vector_map<int32_t, int32_t, 2> test;
+  test.insert(std::make_pair(10, 10));
+  EXPECT_EQ(test.size(), 1);
+  test.insert(std::make_pair(10, 10));
+  EXPECT_EQ(test.size(), 1);
+  test.insert(std::make_pair(20, 10));
+  EXPECT_EQ(test.size(), 2);
+  EXPECT_THROW(test.insert(std::make_pair(30, 10)), std::length_error);
+  EXPECT_EQ(test.size(), 2);
+}
+
+TEST(small_vector, StorageForSortedVectorSet) {
+  small_sorted_vector_set<int32_t, 2> test;
+  test.insert(10);
+  EXPECT_EQ(test.size(), 1);
+  test.insert(10);
+  EXPECT_EQ(test.size(), 1);
+  test.insert(20);
+  EXPECT_EQ(test.size(), 2);
+  test.insert(30);
+  EXPECT_EQ(test.size(), 3);
+}
+
+TEST(small_vector, NoHeapStorageForSortedVectorSet) {
+  noheap_sorted_vector_set<int32_t, 2> test;
+  test.insert(10);
+  EXPECT_EQ(test.size(), 1);
+  test.insert(10);
+  EXPECT_EQ(test.size(), 1);
+  test.insert(20);
+  EXPECT_EQ(test.size(), 2);
+  EXPECT_THROW(test.insert(30), std::length_error);
+  EXPECT_EQ(test.size(), 2);
+}
+
+TEST(small_vector, SelfMoveAssignmentForVectorOfPair) {
+  folly::small_vector<std::pair<int, int>, 2> test;
+  test.emplace_back(13, 2);
+  EXPECT_EQ(test.size(), 1);
+  EXPECT_EQ(test[0].first, 13);
+  test = static_cast<decltype(test)&&>(test); // suppress self-move warning
+  EXPECT_EQ(test.size(), 1);
+  EXPECT_EQ(test[0].first, 13);
+}
+
+TEST(small_vector, SelfCopyAssignmentForVectorOfPair) {
+  folly::small_vector<std::pair<int, int>, 2> test;
+  test.emplace_back(13, 2);
+  EXPECT_EQ(test.size(), 1);
+  EXPECT_EQ(test[0].first, 13);
+  test = static_cast<decltype(test)&>(test); // suppress self-assign warning
+  EXPECT_EQ(test.size(), 1);
+  EXPECT_EQ(test[0].first, 13);
 }

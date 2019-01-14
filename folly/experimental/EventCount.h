@@ -1,5 +1,5 @@
 /*
- * Copyright 2013 Facebook, Inc.
+ * Copyright 2012-present Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,32 +14,21 @@
  * limitations under the License.
  */
 
-#ifndef FOLLY_EXPERIMENTAL_EVENTCOUNT_H_
-#define FOLLY_EXPERIMENTAL_EVENTCOUNT_H_
+#pragma once
 
-#include <unistd.h>
-#include <syscall.h>
-#include <linux/futex.h>
-#include <sys/time.h>
-#include <cassert>
-#include <climits>
 #include <atomic>
+#include <climits>
 #include <thread>
 
-#include "folly/Bits.h"
-#include "folly/Likely.h"
+#include <glog/logging.h>
 
+#include <folly/Likely.h>
+#include <folly/detail/Futex.h>
+#include <folly/lang/Bits.h>
+#include <folly/portability/SysTime.h>
+#include <folly/portability/Unistd.h>
 
 namespace folly {
-
-namespace detail {
-
-inline int futex(int* uaddr, int op, int val, const timespec* timeout,
-                 int* uaddr2, int val3) noexcept {
-  return syscall(SYS_futex, uaddr, op, val, timeout, uaddr2, val3);
-}
-
-}  // namespace detail
 
 /**
  * Event count: a condition variable for lock free algorithms.
@@ -94,11 +83,11 @@ inline int futex(int* uaddr, int op, int val, const timespec* timeout,
  */
 class EventCount {
  public:
-  EventCount() noexcept : val_(0) { }
+  EventCount() noexcept : val_(0) {}
 
   class Key {
     friend class EventCount;
-    explicit Key(uint32_t e) noexcept : epoch_(e) { }
+    explicit Key(uint32_t e) noexcept : epoch_(e) {}
     uint32_t epoch_;
   };
 
@@ -126,14 +115,10 @@ class EventCount {
   static_assert(sizeof(int) == 4, "bad platform");
   static_assert(sizeof(uint32_t) == 4, "bad platform");
   static_assert(sizeof(uint64_t) == 8, "bad platform");
+  static_assert(sizeof(std::atomic<uint64_t>) == 8, "bad platform");
+  static_assert(sizeof(detail::Futex<std::atomic>) == 4, "bad platform");
 
-#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
-  static constexpr size_t kEpochOffset = 1;
-#elif __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
-  static constexpr size_t kEpochOffset = 0;  // in units of sizeof(int)
-#else
-# error Your machine uses a weird endianness!
-#endif
+  static constexpr size_t kEpochOffset = kIsLittleEndian ? 1 : 0;
 
   // val_ stores the epoch in the most significant 32 bits and the
   // waiter count in the least significant 32 bits.
@@ -141,7 +126,7 @@ class EventCount {
 
   static constexpr uint64_t kAddWaiter = uint64_t(1);
   static constexpr uint64_t kSubWaiter = uint64_t(-1);
-  static constexpr size_t  kEpochShift = 32;
+  static constexpr size_t kEpochShift = 32;
   static constexpr uint64_t kAddEpoch = uint64_t(1) << kEpochShift;
   static constexpr uint64_t kWaiterMask = kAddEpoch - 1;
 };
@@ -157,8 +142,8 @@ inline void EventCount::notifyAll() noexcept {
 inline void EventCount::doNotify(int n) noexcept {
   uint64_t prev = val_.fetch_add(kAddEpoch, std::memory_order_acq_rel);
   if (UNLIKELY(prev & kWaiterMask)) {
-    detail::futex(reinterpret_cast<int*>(&val_) + kEpochOffset,
-                  FUTEX_WAKE, n, nullptr, nullptr, 0);
+    detail::futexWake(
+        reinterpret_cast<detail::Futex<std::atomic>*>(&val_) + kEpochOffset, n);
   }
 }
 
@@ -172,24 +157,27 @@ inline void EventCount::cancelWait() noexcept {
   // #waiters gets to 0, the less likely it is that we'll do spurious wakeups
   // (and thus system calls).
   uint64_t prev = val_.fetch_add(kSubWaiter, std::memory_order_seq_cst);
-  assert((prev & kWaiterMask) != 0);
+  DCHECK_NE((prev & kWaiterMask), 0);
 }
 
 inline void EventCount::wait(Key key) noexcept {
   while ((val_.load(std::memory_order_acquire) >> kEpochShift) == key.epoch_) {
-    detail::futex(reinterpret_cast<int*>(&val_) + kEpochOffset,
-                  FUTEX_WAIT, key.epoch_, nullptr, nullptr, 0);
+    detail::futexWait(
+        reinterpret_cast<detail::Futex<std::atomic>*>(&val_) + kEpochOffset,
+        key.epoch_);
   }
   // memory_order_relaxed would suffice for correctness, but the faster
   // #waiters gets to 0, the less likely it is that we'll do spurious wakeups
   // (and thus system calls)
   uint64_t prev = val_.fetch_add(kSubWaiter, std::memory_order_seq_cst);
-  assert((prev & kWaiterMask) != 0);
+  DCHECK_NE((prev & kWaiterMask), 0);
 }
 
 template <class Condition>
 void EventCount::await(Condition condition) {
-  if (condition()) return;  // fast path
+  if (condition()) {
+    return; // fast path
+  }
 
   // condition() is the only thing that may throw, everything else is
   // noexcept, so we can hoist the try/catch block outside of the loop
@@ -209,7 +197,4 @@ void EventCount::await(Condition condition) {
   }
 }
 
-}  // namespace folly
-
-#endif /* FOLLY_EXPERIMENTAL_EVENTCOUNT_H_ */
-
+} // namespace folly

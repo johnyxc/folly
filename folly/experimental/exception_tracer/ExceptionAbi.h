@@ -1,5 +1,5 @@
 /*
- * Copyright 2013 Facebook, Inc.
+ * Copyright 2012-present Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,9 +14,7 @@
  * limitations under the License.
  */
 
-
-#ifndef FOLLY_EXPERIMENTAL_EXCEPTION_TRACER_EXCEPTIONABI_H_
-#define FOLLY_EXPERIMENTAL_EXCEPTION_TRACER_EXCEPTIONABI_H_
+#pragma once
 
 // A clone of the relevant parts of unwind-cxx.h from libstdc++
 // The layout of these structures is defined by the ABI.
@@ -30,7 +28,7 @@ namespace __cxxabiv1 {
 
 struct __cxa_exception {
   std::type_info* exceptionType;
-  void (*exceptionDestructor) (void*);
+  void (*exceptionDestructor)(void*);
   std::unexpected_handler unexpectedHandler;
   std::terminate_handler terminateHandler;
   __cxa_exception* nextException;
@@ -51,11 +49,8 @@ struct __cxa_eh_globals {
 };
 
 extern "C" {
-__cxa_eh_globals* __cxa_get_globals(void);
-__cxa_eh_globals* __cxa_get_globals_fast(void);
+__cxa_eh_globals* __cxa_get_globals(void) noexcept;
+__cxa_eh_globals* __cxa_get_globals_fast(void) noexcept;
 }
 
-}  // namespace __cxxabiv1
-
-#endif /* FOLLY_EXPERIMENTAL_EXCEPTION_TRACER_EXCEPTIONABI_H_ */
-
+} // namespace __cxxabiv1

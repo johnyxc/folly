@@ -1,5 +1,5 @@
 /*
- * Copyright 2013 Facebook, Inc.
+ * Copyright 2013-present Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,13 +14,12 @@
  * limitations under the License.
  */
 
-#include "folly/io/IOBuf.h"
-
-#include <gflags/gflags.h>
-#include "folly/Benchmark.h"
-#include "folly/io/Cursor.h"
-
 #include <vector>
+
+#include <folly/Benchmark.h>
+#include <folly/io/Cursor.h>
+#include <folly/io/IOBuf.h>
+#include <folly/portability/GFlags.h>
 
 using folly::IOBuf;
 using std::unique_ptr;
@@ -31,10 +30,10 @@ size_t buf_size = 0;
 size_t num_bufs = 0;
 
 BENCHMARK(reserveBenchmark, iters) {
-  while (--iters) {
+  while (iters--) {
     unique_ptr<IOBuf> iobuf1(IOBuf::create(buf_size));
     iobuf1->append(buf_size);
-    for (size_t bufs = num_bufs; bufs > 1; bufs --) {
+    for (size_t bufs = num_bufs; bufs > 1; bufs--) {
       iobuf1->reserve(0, buf_size);
       iobuf1->append(buf_size);
     }
@@ -42,10 +41,10 @@ BENCHMARK(reserveBenchmark, iters) {
 }
 
 BENCHMARK(chainBenchmark, iters) {
-  while (--iters) {
+  while (iters--) {
     unique_ptr<IOBuf> iobuf1(IOBuf::create(buf_size));
     iobuf1->append(buf_size);
-    for (size_t bufs = num_bufs; bufs > 1; bufs --) {
+    for (size_t bufs = num_bufs; bufs > 1; bufs--) {
       unique_ptr<IOBuf> iobufNext(IOBuf::create(buf_size));
       iobuf1->prependChain(std::move(iobufNext));
     }
@@ -57,28 +56,28 @@ inline unique_ptr<IOBuf> poolGetIOBuf() {
   if (bufPool.size() > 0) {
     unique_ptr<IOBuf> ret = std::move(bufPool.back());
     bufPool.pop_back();
-    return std::move(ret);
+    return ret;
   } else {
     unique_ptr<IOBuf> iobuf(IOBuf::create(buf_size));
     iobuf->append(buf_size);
-    return std::move(iobuf);
+    return iobuf;
   }
 }
 
 inline void poolPutIOBuf(unique_ptr<IOBuf>&& buf) {
   unique_ptr<IOBuf> head = std::move(buf);
   while (head) {
-    unique_ptr<IOBuf> next = std::move(head->pop());
+    unique_ptr<IOBuf> next = head->pop();
     bufPool.push_back(std::move(head));
     head = std::move(next);
   }
 }
 
 BENCHMARK(poolBenchmark, iters) {
-  while (--iters) {
-    unique_ptr<IOBuf> head = std::move(poolGetIOBuf());
-    for (size_t bufs = num_bufs; bufs > 1; bufs --) {
-      unique_ptr<IOBuf> iobufNext = std::move(poolGetIOBuf());
+  while (iters--) {
+    unique_ptr<IOBuf> head = poolGetIOBuf();
+    for (size_t bufs = num_bufs; bufs > 1; bufs--) {
+      unique_ptr<IOBuf> iobufNext = poolGetIOBuf();
       head->prependChain(std::move(iobufNext));
     }
     // cleanup
@@ -150,7 +149,7 @@ chainBenchmark                         100000  118.6 ms  1.186 us  823.2 k
 poolBenchmark                          100000   32.2 ms    322 ns  2.962 M
 */
 int main(int argc, char** argv) {
-  google::ParseCommandLineFlags(&argc, &argv, true);
+  gflags::ParseCommandLineFlags(&argc, &argv, true);
 
   setNumbers(10, 10);
   folly::runBenchmarks();

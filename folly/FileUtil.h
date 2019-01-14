@@ -1,5 +1,5 @@
 /*
- * Copyright 2013 Facebook, Inc.
+ * Copyright 2013-present Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,16 +14,21 @@
  * limitations under the License.
  */
 
-#ifndef FOLLY_FILEUTIL_H_
-#define FOLLY_FILEUTIL_H_
-
-#include "folly/Portability.h"
+#pragma once
 
 #include <sys/stat.h>
 #include <sys/types.h>
-#include <sys/uio.h>
-#include <fcntl.h>
-#include <unistd.h>
+
+#include <cassert>
+#include <limits>
+
+#include <folly/Portability.h>
+#include <folly/Range.h>
+#include <folly/ScopeGuard.h>
+#include <folly/net/NetworkSocket.h>
+#include <folly/portability/Fcntl.h>
+#include <folly/portability/SysUio.h>
+#include <folly/portability/Unistd.h>
 
 namespace folly {
 
@@ -33,12 +38,18 @@ namespace folly {
  * until all data is written.  Note that *Full wrappers weaken the thread
  * semantics of underlying system calls.
  */
-int openNoInt(const char* name, int flags, mode_t mode=0644);
+int openNoInt(const char* name, int flags, mode_t mode = 0666);
+// Two overloads, as we may be closing either a file or a socket.
 int closeNoInt(int fd);
+int closeNoInt(NetworkSocket fd);
+int dupNoInt(int fd);
+int dup2NoInt(int oldfd, int newfd);
 int fsyncNoInt(int fd);
 int fdatasyncNoInt(int fd);
 int ftruncateNoInt(int fd, off_t len);
 int truncateNoInt(const char* path, off_t len);
+int flockNoInt(int fd, int operation);
+int shutdownNoInt(NetworkSocket fd, int how);
 
 ssize_t readNoInt(int fd, void* buf, size_t n);
 ssize_t preadNoInt(int fd, void* buf, size_t n, off_t offset);
@@ -70,12 +81,10 @@ ssize_t writevNoInt(int fd, const iovec* iov, int count);
  * readv and preadv.  The contents of iov after these functions return
  * is unspecified.
  */
-ssize_t readFull(int fd, void* buf, size_t n);
-ssize_t preadFull(int fd, void* buf, size_t n, off_t offset);
-ssize_t readvFull(int fd, iovec* iov, int count);
-#ifdef FOLLY_HAVE_PREADV
-ssize_t preadvFull(int fd, iovec* iov, int count, off_t offset);
-#endif
+FOLLY_NODISCARD ssize_t readFull(int fd, void* buf, size_t n);
+FOLLY_NODISCARD ssize_t preadFull(int fd, void* buf, size_t n, off_t offset);
+FOLLY_NODISCARD ssize_t readvFull(int fd, iovec* iov, int count);
+FOLLY_NODISCARD ssize_t preadvFull(int fd, iovec* iov, int count, off_t offset);
 
 /**
  * Similar to readFull and preadFull above, wrappers around write() and
@@ -90,15 +99,163 @@ ssize_t preadvFull(int fd, iovec* iov, int count, off_t offset);
  * Note that writevFull and pwritevFull require iov to be non-const, unlike
  * writev and pwritev.  The contents of iov after these functions return
  * is unspecified.
+ *
+ * These functions return -1 on error, or the total number of bytes written
+ * (which is always the same as the number of requested bytes) on success.
  */
 ssize_t writeFull(int fd, const void* buf, size_t n);
 ssize_t pwriteFull(int fd, const void* buf, size_t n, off_t offset);
 ssize_t writevFull(int fd, iovec* iov, int count);
-#ifdef FOLLY_HAVE_PWRITEV
 ssize_t pwritevFull(int fd, iovec* iov, int count, off_t offset);
-#endif
 
-}  // namespaces
+/**
+ * Read entire file (if num_bytes is defaulted) or no more than
+ * num_bytes (otherwise) into container *out. The container is assumed
+ * to be contiguous, with element size equal to 1, and offer size(),
+ * reserve(), and random access (e.g. std::vector<char>, std::string,
+ * fbstring).
+ *
+ * Returns: true on success or false on failure. In the latter case
+ * errno will be set appropriately by the failing system primitive.
+ */
+template <class Container>
+bool readFile(
+    int fd,
+    Container& out,
+    size_t num_bytes = std::numeric_limits<size_t>::max()) {
+  static_assert(
+      sizeof(out[0]) == 1,
+      "readFile: only containers with byte-sized elements accepted");
 
-#endif /* FOLLY_FILEUTIL_H_ */
+  size_t soFar = 0; // amount of bytes successfully read
+  SCOPE_EXIT {
+    DCHECK(out.size() >= soFar); // resize better doesn't throw
+    out.resize(soFar);
+  };
 
+  // Obtain file size:
+  struct stat buf;
+  if (fstat(fd, &buf) == -1) {
+    return false;
+  }
+  // Some files (notably under /proc and /sys on Linux) lie about
+  // their size, so treat the size advertised by fstat under advise
+  // but don't rely on it. In particular, if the size is zero, we
+  // should attempt to read stuff. If not zero, we'll attempt to read
+  // one extra byte.
+  constexpr size_t initialAlloc = 1024 * 4;
+  out.resize(std::min(
+      buf.st_size > 0 ? (size_t(buf.st_size) + 1) : initialAlloc, num_bytes));
+
+  while (soFar < out.size()) {
+    const auto actual = readFull(fd, &out[soFar], out.size() - soFar);
+    if (actual == -1) {
+      return false;
+    }
+    soFar += actual;
+    if (soFar < out.size()) {
+      // File exhausted
+      break;
+    }
+    // Ew, allocate more memory. Use exponential growth to avoid
+    // quadratic behavior. Cap size to num_bytes.
+    out.resize(std::min(out.size() * 3 / 2, num_bytes));
+  }
+
+  return true;
+}
+
+/**
+ * Same as above, but takes in a file name instead of fd
+ */
+template <class Container>
+bool readFile(
+    const char* file_name,
+    Container& out,
+    size_t num_bytes = std::numeric_limits<size_t>::max()) {
+  DCHECK(file_name);
+
+  const auto fd = openNoInt(file_name, O_RDONLY | O_CLOEXEC);
+  if (fd == -1) {
+    return false;
+  }
+
+  SCOPE_EXIT {
+    // Ignore errors when closing the file
+    closeNoInt(fd);
+  };
+
+  return readFile(fd, out, num_bytes);
+}
+
+/**
+ * Writes container to file. The container is assumed to be
+ * contiguous, with element size equal to 1, and offering STL-like
+ * methods empty(), size(), and indexed access
+ * (e.g. std::vector<char>, std::string, fbstring, StringPiece).
+ *
+ * "flags" dictates the open flags to use. Default is to create file
+ * if it doesn't exist and truncate it.
+ *
+ * Returns: true on success or false on failure. In the latter case
+ * errno will be set appropriately by the failing system primitive.
+ *
+ * Note that this function may leave the file in a partially written state on
+ * failure.  Use writeFileAtomic() if you want to ensure that the existing file
+ * state will be unchanged on error.
+ */
+template <class Container>
+bool writeFile(
+    const Container& data,
+    const char* filename,
+    int flags = O_WRONLY | O_CREAT | O_TRUNC,
+    mode_t mode = 0666) {
+  static_assert(
+      sizeof(data[0]) == 1, "writeFile works with element size equal to 1");
+  int fd = open(filename, flags, mode);
+  if (fd == -1) {
+    return false;
+  }
+  bool ok = data.empty() ||
+      writeFull(fd, &data[0], data.size()) == static_cast<ssize_t>(data.size());
+  return closeNoInt(fd) == 0 && ok;
+}
+
+/**
+ * Write file contents "atomically".
+ *
+ * This writes the data to a temporary file in the destination directory, and
+ * then renames it to the specified path.  This guarantees that the specified
+ * file will be replaced the the specified contents on success, or will not be
+ * modified on failure.
+ *
+ * Note that on platforms that do not provide atomic filesystem rename
+ * functionality (e.g., Windows) this behavior may not be truly atomic.
+ */
+void writeFileAtomic(
+    StringPiece filename,
+    iovec* iov,
+    int count,
+    mode_t permissions = 0644);
+void writeFileAtomic(
+    StringPiece filename,
+    ByteRange data,
+    mode_t permissions = 0644);
+void writeFileAtomic(
+    StringPiece filename,
+    StringPiece data,
+    mode_t permissions = 0644);
+
+/**
+ * A version of writeFileAtomic() that returns an errno value instead of
+ * throwing on error.
+ *
+ * Returns 0 on success or an errno value on error.
+ */
+int writeFileAtomicNoThrow(
+    StringPiece filename,
+    iovec* iov,
+    int count,
+    mode_t permissions = 0644);
+
+} // namespace folly

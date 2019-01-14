@@ -1,5 +1,5 @@
 /*
- * Copyright 2013 Facebook, Inc.
+ * Copyright 2012-present Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,12 +14,11 @@
  * limitations under the License.
  */
 
-#ifndef FOLLY_DETAIL_SLOWFINGERPRINT_H_
-#define FOLLY_DETAIL_SLOWFINGERPRINT_H_
+#pragma once
 
-#include "folly/Fingerprint.h"
-#include "folly/detail/FingerprintPolynomial.h"
-#include "folly/Range.h"
+#include <folly/Fingerprint.h>
+#include <folly/Range.h>
+#include <folly/detail/FingerprintPolynomial.h>
 
 namespace folly {
 namespace detail {
@@ -33,10 +32,9 @@ namespace detail {
 template <int BITS>
 class SlowFingerprint {
  public:
-  SlowFingerprint()
-    : poly_(FingerprintTable<BITS>::poly) {
+  SlowFingerprint() : poly_(FingerprintTable<BITS>::poly) {
     // Use the same starting value as Fingerprint, (1 << (BITS-1))
-    fp_.addXk(BITS-1);
+    fp_.addXk(BITS - 1);
   }
 
   SlowFingerprint& update8(uint8_t v) {
@@ -54,7 +52,7 @@ class SlowFingerprint {
     return *this;
   }
 
-  SlowFingerprint& update(const folly::StringPiece& str) {
+  SlowFingerprint& update(const folly::StringPiece str) {
     const char* p = str.start();
     for (int i = str.size(); i != 0; p++, i--) {
       update8(static_cast<uint8_t>(*p));
@@ -63,7 +61,9 @@ class SlowFingerprint {
   }
 
   void write(uint64_t* out) const {
-    fp_.write(out);
+    for (int i = 0; i < fp_.size(); ++i) {
+      out[i] = fp_.get(i);
+    }
   }
 
  private:
@@ -75,19 +75,16 @@ class SlowFingerprint {
   }
 
   void updateLSB(uint64_t val, int bits) {
-    val <<= (64-bits);
+    val <<= (64 - bits);
     for (; bits != 0; --bits) {
-      updateBit(val & (1UL << 63));
+      updateBit(val & (1ULL << 63));
       val <<= 1;
     }
   }
 
-  const FingerprintPolynomial<BITS-1> poly_;
-  FingerprintPolynomial<BITS-1> fp_;
+  const FingerprintPolynomial<BITS - 1> poly_;
+  FingerprintPolynomial<BITS - 1> fp_;
 };
 
-}  // namespace detail
-}  // namespace folly
-
-#endif /* FOLLY_DETAIL_SLOWFINGERPRINT_H_ */
-
+} // namespace detail
+} // namespace folly

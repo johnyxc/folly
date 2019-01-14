@@ -1,5 +1,5 @@
 /*
- * Copyright 2013 Facebook, Inc.
+ * Copyright 2012-present Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,10 +14,10 @@
  * limitations under the License.
  */
 
-#ifndef FOLLY_DETAIL_GROUPVARINTDETAIL_H_
-#define FOLLY_DETAIL_GROUPVARINTDETAIL_H_
+#pragma once
 
 #include <stddef.h>
+#include <stdint.h>
 
 namespace folly {
 
@@ -31,7 +31,7 @@ struct GroupVarintTraits;
 
 template <>
 struct GroupVarintTraits<uint32_t> {
-  enum {
+  enum : uint32_t {
     kGroupSize = 4,
     kHeaderSize = 1,
   };
@@ -39,7 +39,7 @@ struct GroupVarintTraits<uint32_t> {
 
 template <>
 struct GroupVarintTraits<uint64_t> {
-  enum {
+  enum : uint32_t {
     kGroupSize = 5,
     kHeaderSize = 2,
   };
@@ -49,7 +49,7 @@ template <typename T>
 class GroupVarintBase {
  protected:
   typedef GroupVarintTraits<T> Traits;
-  enum { kHeaderSize = Traits::kHeaderSize };
+  enum : uint32_t { kHeaderSize = Traits::kHeaderSize };
 
  public:
   typedef T type;
@@ -57,12 +57,12 @@ class GroupVarintBase {
   /**
    * Number of integers encoded / decoded in one pass.
    */
-  enum { kGroupSize = Traits::kGroupSize };
+  enum : uint32_t { kGroupSize = Traits::kGroupSize };
 
   /**
    * Maximum encoded size.
    */
-  enum { kMaxSize = kHeaderSize + sizeof(type) * kGroupSize };
+  enum : uint32_t { kMaxSize = kHeaderSize + sizeof(type) * kGroupSize };
 
   /**
    * Maximum size for n values.
@@ -97,8 +97,5 @@ class GroupVarintBase {
   enum { kFullGroupSize = kHeaderSize + kGroupSize * sizeof(type) };
 };
 
-}  // namespace detail
-}  // namespace folly
-
-#endif /* FOLLY_DETAIL_GROUPVARINTDETAIL_H_ */
-
+} // namespace detail
+} // namespace folly

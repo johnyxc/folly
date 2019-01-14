@@ -1,5 +1,5 @@
 /*
- * Copyright 2013 Facebook, Inc.
+ * Copyright 2011-present Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,10 +14,12 @@
  * limitations under the License.
  */
 
-#ifndef FOLLY_DETAIL_DISCRIMINATEDPTRDETAIL_H_
-#define FOLLY_DETAIL_DISCRIMINATEDPTRDETAIL_H_
+#pragma once
 
 #include <type_traits>
+#include <utility>
+
+#include <folly/functional/Invoke.h>
 
 namespace folly {
 namespace dptr_detail {
@@ -30,7 +32,8 @@ namespace dptr_detail {
  * GetIndex<int, void, char, int>::value == 3
  * GetIndex<int, void, char>::value -> fails to compile
  */
-template <typename... Types> struct GetTypeIndex;
+template <typename... Types>
+struct GetTypeIndex;
 
 // When recursing, we never reach the 0- or 1- template argument base case
 // unless the target type is not in the list.  If the target type is in the
@@ -63,7 +66,7 @@ struct IsSameType<T> {
 template <typename T, typename U, typename... Types>
 struct IsSameType<T, U, Types...> {
   static const bool value =
-    std::is_same<T,U>::value && IsSameType<U, Types...>::value;
+      std::is_same<T, U>::value && IsSameType<U, Types...>::value;
 };
 
 // Define type as the type of all T in (non-empty) Types..., asserting that
@@ -74,22 +77,23 @@ struct SameType;
 template <typename T, typename... Types>
 struct SameType<T, Types...> {
   typedef T type;
-  static_assert(IsSameType<T, Types...>::value,
-                "Not all types in pack are the same");
+  static_assert(
+      IsSameType<T, Types...>::value,
+      "Not all types in pack are the same");
 };
 
 // Determine the result type of applying a visitor of type V on a pointer
 // to type T.
 template <typename V, typename T>
 struct VisitorResult1 {
-  typedef typename std::result_of<V (T*)>::type type;
+  typedef invoke_result_t<V, T*> type;
 };
 
 // Determine the result type of applying a visitor of type V on a const pointer
 // to type T.
 template <typename V, typename T>
 struct ConstVisitorResult1 {
-  typedef typename std::result_of<V (const T*)>::type type;
+  typedef invoke_result_t<V, const T*> type;
 };
 
 // Determine the result type of applying a visitor of type V on pointers of
@@ -97,8 +101,8 @@ struct ConstVisitorResult1 {
 // in Types...
 template <typename V, typename... Types>
 struct VisitorResult {
-  typedef typename SameType<
-    typename VisitorResult1<V,Types>::type...>::type type;
+  typedef
+      typename SameType<typename VisitorResult1<V, Types>::type...>::type type;
 };
 
 // Determine the result type of applying a visitor of type V on const pointers
@@ -106,60 +110,64 @@ struct VisitorResult {
 // in Types...
 template <typename V, typename... Types>
 struct ConstVisitorResult {
-  typedef typename SameType<
-    typename ConstVisitorResult1<V,Types>::type...>::type type;
+  typedef
+      typename SameType<typename ConstVisitorResult1<V, Types>::type...>::type
+          type;
 };
 
-template <typename V, typename R, typename... Types> struct ApplyVisitor1;
-
-template <typename V, typename R>
-struct ApplyVisitor1<V, R> {
-  R operator()(size_t index, V&& visitor, void* ptr) const {
-    CHECK(false);  // NOTREACHED
-  }
-};
+template <size_t index, typename V, typename R, typename... Types>
+struct ApplyVisitor1;
 
 template <typename V, typename R, typename T, typename... Types>
-struct ApplyVisitor1<V, R, T, Types...> {
-  R operator()(size_t index, V&& visitor, void* ptr) const {
-    return (index == 1 ? visitor(static_cast<T*>(ptr)) :
-            ApplyVisitor1<V, R, Types...>()(
-              index - 1, std::forward<V>(visitor), ptr));
+struct ApplyVisitor1<1, V, R, T, Types...> {
+  R operator()(size_t, V&& visitor, void* ptr) const {
+    return visitor(static_cast<T*>(ptr));
   }
 };
 
-template <typename V, typename R, typename... Types> struct ApplyConstVisitor1;
-
-template <typename V, typename R>
-struct ApplyConstVisitor1<V, R> {
-  R operator()(size_t index, V&& visitor, void* ptr) const {
-    CHECK(false);  // NOTREACHED
+template <size_t index, typename V, typename R, typename T, typename... Types>
+struct ApplyVisitor1<index, V, R, T, Types...> {
+  R operator()(size_t runtimeIndex, V&& visitor, void* ptr) const {
+    return runtimeIndex == 1
+        ? visitor(static_cast<T*>(ptr))
+        : ApplyVisitor1<index - 1, V, R, Types...>()(
+              runtimeIndex - 1, std::forward<V>(visitor), ptr);
   }
 };
+
+template <size_t index, typename V, typename R, typename... Types>
+struct ApplyConstVisitor1;
 
 template <typename V, typename R, typename T, typename... Types>
-struct ApplyConstVisitor1<V, R, T, Types...> {
-  R operator()(size_t index, V&& visitor, void* ptr) const {
-    return (index == 1 ? visitor(static_cast<const T*>(ptr)) :
-            ApplyConstVisitor1<V, R, Types...>()(
-              index - 1, std::forward<V>(visitor), ptr));
+struct ApplyConstVisitor1<1, V, R, T, Types...> {
+  R operator()(size_t, V&& visitor, void* ptr) const {
+    return visitor(static_cast<const T*>(ptr));
+  }
+};
+
+template <size_t index, typename V, typename R, typename T, typename... Types>
+struct ApplyConstVisitor1<index, V, R, T, Types...> {
+  R operator()(size_t runtimeIndex, V&& visitor, void* ptr) const {
+    return runtimeIndex == 1
+        ? visitor(static_cast<const T*>(ptr))
+        : ApplyConstVisitor1<index - 1, V, R, Types...>()(
+              runtimeIndex - 1, std::forward<V>(visitor), ptr);
   }
 };
 
 template <typename V, typename... Types>
-struct ApplyVisitor
-  : ApplyVisitor1<
-      V, typename VisitorResult<V, Types...>::type, Types...> {
-};
+using ApplyVisitor = ApplyVisitor1<
+    sizeof...(Types),
+    V,
+    typename VisitorResult<V, Types...>::type,
+    Types...>;
 
 template <typename V, typename... Types>
-struct ApplyConstVisitor
-  : ApplyConstVisitor1<
-      V, typename ConstVisitorResult<V, Types...>::type, Types...> {
-};
+using ApplyConstVisitor = ApplyConstVisitor1<
+    sizeof...(Types),
+    V,
+    typename ConstVisitorResult<V, Types...>::type,
+    Types...>;
 
-}  // namespace dptr_detail
-}  // namespace folly
-
-#endif /* FOLLY_DETAIL_DISCRIMINATEDPTRDETAIL_H_ */
-
+} // namespace dptr_detail
+} // namespace folly

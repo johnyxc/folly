@@ -19,12 +19,18 @@ Here are some code samples to get started:
 
 ``` Cpp
 using folly::format;
+using folly::sformat;
 using folly::vformat;
+using folly::svformat;
 
 // Objects produced by format() can be streamed without creating
 // an intermediary string; {} yields the next argument using default
 // formatting.
 std::cout << format("The answers are {} and {}", 23, 42);
+// => "The answers are 23 and 42"
+
+// If you just want the string, though, you're covered.
+std::string result = sformat("The answers are {} and {}", 23, 42);
 // => "The answers are 23 and 42"
 
 // To insert a literal '{' or '}', just double it.
@@ -54,6 +60,11 @@ std::cout << vformat("The only {what} is {value}", m);
 // same as
 std::cout << format("The only {0[what]} is {0[value]}", m);
 // => "The only answer is 42"
+// And if you just want the string,
+std::string result = svformat("The only {what} is {value}", m);
+// => "The only answer is 42"
+std::string result = sformat("The only {0[what]} is {0[value]}", m);
+// => "The only answer is 42"
 
 // {} works for vformat too
 std::vector<int> v {42, 23};
@@ -71,6 +82,16 @@ std::cout << vformat("{0} {2} {1}", t);
 std::cout << format("{:X<10} {}", "hello", "world");
 // => "helloXXXXX world"
 
+// Field width may be a runtime value rather than part of the format string
+int x = 6;
+std::cout << format("{:-^*}", x, "hi");
+// => "--hi--"
+
+// Explicit arguments work with dynamic field width, as long as indexes are
+// given for both the value and the field width.
+std::cout << format("{2:+^*0}",
+9, "unused", 456); // => "+++456+++"
+
 // Format supports printf-style format specifiers
 std::cout << format("{0:05d} decimal = {0:04x} hex", 42);
 // => "00042 decimal = 002a hex"
@@ -81,6 +102,10 @@ std::cout << format("{0:05d} decimal = {0:04x} hex", 42);
 std::string s = format("The only answer is {}", 42).str();
 std::cout << s;
 // => "The only answer is 42"
+
+// Decimal precision usage
+std::cout << format("Only 2 decimals is {:.2f}", 23.34134534535);
+// => "Only 2 decimals is 23.34"
 ```
 
 
@@ -113,7 +138,7 @@ Format string (`vformat`):
 - `format_spec`: format specification, see below
 
 Format specification:
-`[[fill] align] [sign] ["#"] ["0"] [width] [","] ["." precision] [type]`
+`[[fill] align] [sign] ["#"] ["0"] [width] [","] ["." precision] ["."] [type]`
 
 - `fill` (may only be specified if `align` is also specified): pad with this
   character ('` `' (space) or '`0`' (zero) might be useful; space is default)
@@ -131,13 +156,18 @@ Format specification:
   `0X` for hexadecimal; only valid for integers)
 - '`0`': 0-pad after sign, same as specifying "`0=`" as the `fill` and
   `align` parameters (only valid for numbers)
-- `width`: minimum field width
+- `width`: minimum field width. May be '`*`' to indicate that the field width
+  is given by an argument. Defaults to the next argument (preceding the value
+  to be formatted) but an explicit argument index may be given following the
+  '`*`'. Not supported in `vformat()`.
 - '`,`' (comma): output comma as thousands' separator (only valid for integers,
   and only for decimal output)
 - `precision` (not allowed for integers):
     - for floating point values, number of digits after decimal point ('`f`' or
       '`F`' presentation) or number of significant digits ('`g`' or '`G`')
     - for others, maximum field size (truncate subsequent characters)
+- '`.`' (when used after precision or in lieu of precison): Forces a trailing
+  decimal point to make it clear this is a floating point value.
 - `type`: presentation format, see below
 
 Presentation formats:
@@ -178,4 +208,3 @@ You can extend `format` for your own class by providing a specialization for
 `folly::FormatValue`.  See `folly/Format.h` and `folly/FormatArg.h` for
 details, and the existing specialization for `folly::dynamic` in
 `folly/dynamic-inl.h` for an implementation example.
-

@@ -1,5 +1,5 @@
 /*
- * Copyright 2013 Facebook, Inc.
+ * Copyright 2013-present Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -13,13 +13,13 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include "folly/Lazy.h"
+#include <folly/Lazy.h>
 
-#include <map>
 #include <functional>
 #include <iostream>
+#include <map>
 
-#include <gtest/gtest.h>
+#include <folly/portability/GTest.h>
 
 namespace folly {
 
@@ -27,7 +27,8 @@ TEST(Lazy, Simple) {
   int computeCount = 0;
 
   auto const val = folly::lazy([&]() -> int {
-    EXPECT_EQ(++computeCount, 1);
+    ++computeCount;
+    EXPECT_EQ(computeCount, 1);
     return 12;
   });
   EXPECT_EQ(computeCount, 0);
@@ -44,9 +45,10 @@ TEST(Lazy, Simple) {
   EXPECT_EQ(computeCount, 1);
 }
 
-auto globalCount = folly::lazy([]{ return 0; });
+auto globalCount = folly::lazy([] { return 0; });
 auto const foo = folly::lazy([]() -> std::string {
-  EXPECT_EQ(++globalCount(), 1);
+  ++globalCount();
+  EXPECT_EQ(globalCount(), 1);
   return std::string("YEP");
 });
 
@@ -57,10 +59,10 @@ TEST(Lazy, Global) {
 }
 
 TEST(Lazy, Map) {
-  auto lazyMap = folly::lazy([]() -> std::map<std::string,std::string> {
+  auto lazyMap = folly::lazy([]() -> std::map<std::string, std::string> {
     return {
-      { "foo", "bar" },
-      { "baz", "quux" }
+        {"foo", "bar"},
+        {"baz", "quux"},
     };
   });
 
@@ -71,12 +73,16 @@ TEST(Lazy, Map) {
 
 struct CopyCount {
   CopyCount() {}
-  CopyCount(const CopyCount&) { ++count; }
-  CopyCount(CopyCount&&)      {}
+  CopyCount(const CopyCount&) {
+    ++count;
+  }
+  CopyCount(CopyCount&&) noexcept {}
 
   static int count;
 
-  bool operator()() const { return true ; }
+  bool operator()() const {
+    return true;
+  }
 };
 
 int CopyCount::count = 0;
@@ -93,16 +99,15 @@ TEST(Lazy, NonLambda) {
   EXPECT_EQ(lval(), true);
   EXPECT_EQ(CopyCount::count, 1);
 
-  std::function<bool()> f = [&]{ return 12; };
+  std::function<bool()> f = [&] { return 12; };
   auto const lazyF = folly::lazy(f);
   EXPECT_EQ(lazyF(), true);
 }
 
 TEST(Lazy, Consty) {
-  std::function<int ()> const f = [&] { return 12; };
+  std::function<int()> const f = [&] { return 12; };
   auto lz = folly::lazy(f);
   EXPECT_EQ(lz(), 12);
 }
 
-}
-
+} // namespace folly

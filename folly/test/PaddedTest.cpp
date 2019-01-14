@@ -1,5 +1,5 @@
 /*
- * Copyright 2013 Facebook, Inc.
+ * Copyright 2012-present Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,10 +14,11 @@
  * limitations under the License.
  */
 
-#include "folly/Padded.h"
+#include <folly/Padded.h>
 
 #include <glog/logging.h>
-#include <gtest/gtest.h>
+
+#include <folly/portability/GTest.h>
 
 using namespace folly;
 
@@ -50,8 +51,8 @@ TEST(NodeTest, Padding) {
   };
   EXPECT_EQ(1, alignof(SevenBytes));
   typedef padded::Node<SevenBytes, 64> SevenByteNode;
-  EXPECT_EQ(9, SevenByteNode::kElementCount);  // 64 / 7
-  EXPECT_EQ(1, SevenByteNode::kPaddingBytes);  // 64 % 7
+  EXPECT_EQ(9, SevenByteNode::kElementCount); // 64 / 7
+  EXPECT_EQ(1, SevenByteNode::kPaddingBytes); // 64 % 7
   EXPECT_EQ(1, alignof(SevenByteNode));
   EXPECT_EQ(64, sizeof(SevenByteNode));
   EXPECT_EQ(0, SevenByteNode::nodeCount(0));
@@ -84,11 +85,11 @@ class IntPaddedTestBase : public ::testing::Test {
 
 class IntPaddedConstTest : public IntPaddedTestBase {
  protected:
-  void SetUp() {
+  void SetUp() override {
     v_.resize(4);
     n_ = 0;
     for (int i = 0; i < 4; i++) {
-      for (int j = 0; j < IntNode::kElementCount; ++j, ++n_) {
+      for (size_t j = 0; j < IntNode::kElementCount; ++j, ++n_) {
         v_[i].data()[j] = n_;
       }
     }
@@ -145,8 +146,7 @@ TEST_F(IntPaddedConstTest, Arithmetic) {
   }
 }
 
-class IntPaddedNonConstTest : public IntPaddedTestBase {
-};
+class IntPaddedNonConstTest : public IntPaddedTestBase {};
 
 TEST_F(IntPaddedNonConstTest, Iteration) {
   v_.resize(4);
@@ -160,7 +160,7 @@ TEST_F(IntPaddedNonConstTest, Iteration) {
 
   k = 0;
   for (int i = 0; i < 4; i++) {
-    for (int j = 0; j < IntNode::kElementCount; ++j, ++k) {
+    for (size_t j = 0; j < IntNode::kElementCount; ++j, ++k) {
       EXPECT_EQ(k, v_[i].data()[j]);
     }
   }
@@ -181,11 +181,11 @@ class StructPaddedTestBase : public ::testing::Test {
 
 class StructPaddedConstTest : public StructPaddedTestBase {
  protected:
-  void SetUp() {
+  void SetUp() override {
     v_.resize(4);
     n_ = 0;
     for (int i = 0; i < 4; i++) {
-      for (int j = 0; j < PointNode::kElementCount; ++j, ++n_) {
+      for (size_t j = 0; j < PointNode::kElementCount; ++j, ++n_) {
         auto& point = v_[i].data()[j];
         point.x = n_;
         point.y = n_ + 1;
@@ -240,3 +240,23 @@ TEST_F(IntAdaptorTest, ResizeConstructor) {
   }
 }
 
+TEST_F(IntAdaptorTest, SimpleEmplaceBack) {
+  for (int i = 0; i < n_; ++i) {
+    EXPECT_EQ((i == 0), a_.empty());
+    EXPECT_EQ(i, a_.size());
+    a_.emplace_back(i);
+  }
+  EXPECT_EQ(n_, a_.size());
+
+  int k = 0;
+  for (auto it = a_.begin(); it != a_.end(); ++it, ++k) {
+    EXPECT_EQ(k, a_[k]);
+    EXPECT_EQ(k, *it);
+  }
+  EXPECT_EQ(n_, k);
+
+  auto p = a_.move();
+  EXPECT_TRUE(a_.empty());
+  EXPECT_EQ(16, p.second);
+  EXPECT_TRUE(v_ == p.first);
+}

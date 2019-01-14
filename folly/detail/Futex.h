@@ -1,5 +1,5 @@
 /*
- * Copyright 2013 Facebook, Inc.
+ * Copyright 2013-present Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,15 +17,23 @@
 #pragma once
 
 #include <atomic>
+#include <cassert>
+#include <chrono>
+#include <cstdint>
 #include <limits>
-#include <assert.h>
-#include <errno.h>
-#include <linux/futex.h>
-#include <sys/syscall.h>
-#include <unistd.h>
-#include <boost/noncopyable.hpp>
+#include <type_traits>
 
-namespace folly { namespace detail {
+#include <folly/portability/Unistd.h>
+
+namespace folly {
+namespace detail {
+
+enum class FutexResult {
+  VALUE_CHANGED, /* futex value didn't match expected */
+  AWOKEN, /* wakeup by matching futex wake, or spurious wakeup */
+  INTERRUPTED, /* wakeup by interrupting signal */
+  TIMEDOUT, /* wakeup by expiring deadline */
+};
 
 /**
  * Futex is an atomic 32 bit unsigned integer that provides access to the
@@ -35,50 +43,70 @@ namespace folly { namespace detail {
  * If you don't know how to use futex(), you probably shouldn't be using
  * this class.  Even if you do know how, you should have a good reason
  * (and benchmarks to back you up).
+ *
+ * Because of the semantics of the futex syscall, the futex family of
+ * functions are available as free functions rather than member functions
  */
 template <template <typename> class Atom = std::atomic>
-struct Futex : Atom<uint32_t>, boost::noncopyable {
+using Futex = Atom<std::uint32_t>;
 
-  explicit Futex(uint32_t init = 0) : Atom<uint32_t>(init) {}
+/**
+ * Puts the thread to sleep if this->load() == expected.  Returns true when
+ * it is returning because it has consumed a wake() event, false for any
+ * other return (signal, this->load() != expected, or spurious wakeup).
+ */
+template <typename Futex>
+FutexResult
+futexWait(const Futex* futex, uint32_t expected, uint32_t waitMask = -1);
 
-  /** Puts the thread to sleep if this->load() == expected.  Returns true when
-   *  it is returning because it has consumed a wake() event, false for any
-   *  other return (signal, this->load() != expected, or spurious wakeup). */
-  bool futexWait(uint32_t expected, uint32_t waitMask = -1);
+/**
+ * Similar to futexWait but also accepts a deadline until when the wait call
+ * may block.
+ *
+ * Optimal clock types: std::chrono::system_clock, std::chrono::steady_clock.
+ * NOTE: On some systems steady_clock is just an alias for system_clock,
+ * and is not actually steady.
+ *
+ * For any other clock type, now() will be invoked twice.
+ */
+template <
+    typename Futex,
+    class Clock,
+    class Duration = typename Clock::duration>
+FutexResult futexWaitUntil(
+    const Futex* futex,
+    uint32_t expected,
+    std::chrono::time_point<Clock, Duration> const& deadline,
+    uint32_t waitMask = -1);
 
-  /** Wakens up to count waiters where (waitMask & wakeMask) != 0,
-   *  returning the number of awoken threads. */
-  int futexWake(int count = std::numeric_limits<int>::max(),
-                uint32_t wakeMask = -1);
+/**
+ * Wakes up to count waiters where (waitMask & wakeMask) != 0, returning the
+ * number of awoken threads, or -1 if an error occurred.  Note that when
+ * constructing a concurrency primitive that can guard its own destruction, it
+ * is likely that you will want to ignore EINVAL here (as well as making sure
+ * that you never touch the object after performing the memory store that is
+ * the linearization point for unlock or control handoff).  See
+ * https://sourceware.org/bugzilla/show_bug.cgi?id=13690
+ */
+template <typename Futex>
+int futexWake(
+    const Futex* futex,
+    int count = std::numeric_limits<int>::max(),
+    uint32_t wakeMask = -1);
+
+/** A std::atomic subclass that can be used to force Futex to emulate
+ *  the underlying futex() syscall.  This is primarily useful to test or
+ *  benchmark the emulated implementation on systems that don't need it. */
+template <typename T>
+struct EmulatedFutexAtomic : public std::atomic<T> {
+  EmulatedFutexAtomic() noexcept = default;
+  constexpr /* implicit */ EmulatedFutexAtomic(T init) noexcept
+      : std::atomic<T>(init) {}
+  // It doesn't copy or move
+  EmulatedFutexAtomic(EmulatedFutexAtomic&& rhs) = delete;
 };
 
-template <>
-inline bool Futex<std::atomic>::futexWait(uint32_t expected,
-                                          uint32_t waitMask) {
-  assert(sizeof(*this) == sizeof(int));
-  int rv = syscall(SYS_futex,
-                   this, /* addr1 */
-                   FUTEX_WAIT_BITSET | FUTEX_PRIVATE_FLAG, /* op */
-                   expected, /* val */
-                   nullptr, /* timeout */
-                   nullptr, /* addr2 */
-                   waitMask); /* val3 */
-  assert(rv == 0 || (errno == EWOULDBLOCK || errno == EINTR));
-  return rv == 0;
-}
+} // namespace detail
+} // namespace folly
 
-template <>
-inline int Futex<std::atomic>::futexWake(int count, uint32_t wakeMask) {
-  assert(sizeof(*this) == sizeof(int));
-  int rv = syscall(SYS_futex,
-                   this, /* addr1 */
-                   FUTEX_WAKE_BITSET | FUTEX_PRIVATE_FLAG, /* op */
-                   count, /* val */
-                   nullptr, /* timeout */
-                   nullptr, /* addr2 */
-                   wakeMask); /* val3 */
-  assert(rv >= 0);
-  return rv;
-}
-
-}}
+#include <folly/detail/Futex-inl.h>

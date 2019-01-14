@@ -1,5 +1,5 @@
 /*
- * Copyright 2013 Facebook, Inc.
+ * Copyright 2013-present Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -22,17 +22,16 @@
 // will verify that the file actually gets created, which means that everything
 // worked as intended.
 
-#include <sys/types.h>
-#include <sys/stat.h>
 #include <fcntl.h>
 #include <signal.h>
-#include <unistd.h>
+#include <sys/types.h>
 
-#include <gflags/gflags.h>
 #include <glog/logging.h>
 
-#include "folly/Conv.h"
-#include "folly/Subprocess.h"
+#include <folly/Conv.h>
+#include <folly/Subprocess.h>
+#include <folly/portability/GFlags.h>
+#include <folly/portability/Unistd.h>
 
 using folly::Subprocess;
 
@@ -40,40 +39,29 @@ DEFINE_bool(child, false, "");
 
 namespace {
 constexpr int kSignal = SIGUSR1;
-volatile bool caught = false;
-
-void signalHandler(int sig) {
-  if (sig != kSignal) {
-    abort();
-  }
-  caught = true;
-}
-
-}  // namespace
+} // namespace
 
 void runChild(const char* file) {
-  struct sigaction sa;
-  sa.sa_handler = signalHandler;
-  sigemptyset(&sa.sa_mask);
-  sa.sa_flags = 0;
-  CHECK_ERR(sigaction(kSignal, &sa, nullptr));
+  // Block SIGUSR1 so it's queued
+  sigset_t sigs;
+  CHECK_ERR(sigemptyset(&sigs));
+  CHECK_ERR(sigaddset(&sigs, kSignal));
+  CHECK_ERR(sigprocmask(SIG_BLOCK, &sigs, nullptr));
 
   // Kill the parent, wait for our signal.
   CHECK_ERR(kill(getppid(), SIGKILL));
 
-  while (!caught) {
-    pause();
-  }
+  int sig = 0;
+  CHECK_ERR(sigwait(&sigs, &sig));
+  CHECK_EQ(sig, kSignal);
 
   // Signal completion by creating the file
   CHECK_ERR(creat(file, 0600));
 }
 
-void runParent(const char* file) {
-  std::vector<std::string> args {"/proc/self/exe", "--child", file};
-  Subprocess proc(
-      args,
-      Subprocess::Options().parentDeathSignal(kSignal));
+[[noreturn]] void runParent(const char* file) {
+  std::vector<std::string> args{"/proc/self/exe", "--child", file};
+  Subprocess proc(args, Subprocess::Options().parentDeathSignal(kSignal));
   CHECK(proc.poll().running());
 
   // The child will kill us.
@@ -82,8 +70,8 @@ void runParent(const char* file) {
   }
 }
 
-int main(int argc, char *argv[]) {
-  google::ParseCommandLineFlags(&argc, &argv, true);
+int main(int argc, char* argv[]) {
+  gflags::ParseCommandLineFlags(&argc, &argv, true);
   CHECK_EQ(argc, 2);
   if (FLAGS_child) {
     runChild(argv[1]);
@@ -92,4 +80,3 @@ int main(int argc, char *argv[]) {
   }
   return 0;
 }
-

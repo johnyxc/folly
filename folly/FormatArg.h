@@ -1,5 +1,5 @@
 /*
- * Copyright 2013 Facebook, Inc.
+ * Copyright 2012-present Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,16 +14,22 @@
  * limitations under the License.
  */
 
-#ifndef FOLLY_FORMATARG_H_
-#define FOLLY_FORMATARG_H_
+#pragma once
 
 #include <stdexcept>
-#include "folly/Conv.h"
-#include "folly/Likely.h"
-#include "folly/Portability.h"
-#include "folly/Range.h"
+
+#include <folly/CPortability.h>
+#include <folly/Conv.h>
+#include <folly/Likely.h>
+#include <folly/Portability.h>
+#include <folly/Range.h>
+#include <folly/lang/Exception.h>
 
 namespace folly {
+
+class FOLLY_EXPORT BadFormatArg : public std::invalid_argument {
+  using invalid_argument::invalid_argument;
+};
 
 /**
  * Parsed format argument.
@@ -34,16 +40,18 @@ struct FormatArg {
    * passed-in string -- does not copy the given characters.
    */
   explicit FormatArg(StringPiece sp)
-    : fullArgString(sp),
-      fill(kDefaultFill),
-      align(Align::DEFAULT),
-      sign(Sign::DEFAULT),
-      basePrefix(false),
-      thousandsSeparator(false),
-      width(kDefaultWidth),
-      precision(kDefaultPrecision),
-      presentation(kDefaultPresentation),
-      nextKeyMode_(NextKeyMode::NONE) {
+      : fullArgString(sp),
+        fill(kDefaultFill),
+        align(Align::DEFAULT),
+        sign(Sign::DEFAULT),
+        basePrefix(false),
+        thousandsSeparator(false),
+        trailingDot(false),
+        width(kDefaultWidth),
+        widthIndex(kNoIndex),
+        precision(kDefaultPrecision),
+        presentation(kDefaultPresentation),
+        nextKeyMode_(NextKeyMode::NONE) {
     if (!sp.empty()) {
       initSlow();
     }
@@ -52,7 +60,7 @@ struct FormatArg {
   enum class Type {
     INTEGER,
     FLOAT,
-    OTHER
+    OTHER,
   };
   /**
    * Validate the argument for the given type; throws on error.
@@ -64,15 +72,19 @@ struct FormatArg {
    * message will contain the argument string as well as any passed-in
    * arguments to enforce, formatted using folly::to<std::string>.
    */
-  template <typename... Args>
-  void enforce(bool v, Args&&... args) const {
+  template <typename Check, typename... Args>
+  void enforce(Check const& v, Args&&... args) const {
+    static_assert(std::is_constructible<bool, Check>::value, "not castable");
     if (UNLIKELY(!v)) {
       error(std::forward<Args>(args)...);
     }
   }
 
   template <typename... Args>
-  void error(Args&&... args) const FOLLY_NORETURN;
+  std::string errorStr(Args&&... args) const;
+  template <typename... Args>
+  [[noreturn]] void error(Args&&... args) const;
+
   /**
    * Full argument string, as passed in to the constructor.
    */
@@ -93,7 +105,7 @@ struct FormatArg {
     RIGHT,
     PAD_AFTER_SIGN,
     CENTER,
-    INVALID
+    INVALID,
   };
   Align align;
 
@@ -105,7 +117,7 @@ struct FormatArg {
     PLUS_OR_MINUS,
     MINUS,
     SPACE_OR_MINUS,
-    INVALID
+    INVALID,
   };
   Sign sign;
 
@@ -120,10 +132,18 @@ struct FormatArg {
   bool thousandsSeparator;
 
   /**
-   * Field width
+   * Force a trailing decimal on doubles which could be rendered as ints
+   */
+  bool trailingDot;
+
+  /**
+   * Field width and optional argument index
    */
   static constexpr int kDefaultWidth = -1;
+  static constexpr int kDynamicWidth = -2;
+  static constexpr int kNoIndex = -1;
   int width;
+  int widthIndex;
 
   /**
    * Precision
@@ -141,7 +161,7 @@ struct FormatArg {
    * Split a key component from "key", which must be non-empty (an exception
    * is thrown otherwise).
    */
-  template <bool emptyOk=false>
+  template <bool emptyOk = false>
   StringPiece splitKey();
 
   /**
@@ -186,10 +206,17 @@ struct FormatArg {
 };
 
 template <typename... Args>
-inline void FormatArg::error(Args&&... args) const {
-  throw std::invalid_argument(to<std::string>(
-      "folly::format: invalid format argument {", fullArgString, "}: ",
-      std::forward<Args>(args)...));
+inline std::string FormatArg::errorStr(Args&&... args) const {
+  return to<std::string>(
+      "invalid format argument {",
+      fullArgString,
+      "}: ",
+      std::forward<Args>(args)...);
+}
+
+template <typename... Args>
+[[noreturn]] inline void FormatArg::error(Args&&... args) const {
+  throw_exception<BadFormatArg>(errorStr(std::forward<Args>(args)...));
 }
 
 template <bool emptyOk>
@@ -202,14 +229,14 @@ template <bool emptyOk>
 inline StringPiece FormatArg::doSplitKey() {
   if (nextKeyMode_ == NextKeyMode::STRING) {
     nextKeyMode_ = NextKeyMode::NONE;
-    if (!emptyOk) {  // static
+    if (!emptyOk) { // static
       enforce(!nextKey_.empty(), "non-empty key required");
     }
     return nextKey_;
   }
 
   if (key_.empty()) {
-    if (!emptyOk) {  // static
+    if (!emptyOk) { // static
       error("non-empty key required");
     }
     return StringPiece();
@@ -220,10 +247,10 @@ inline StringPiece FormatArg::doSplitKey() {
   const char* p;
   if (e[-1] == ']') {
     --e;
-    p = static_cast<const char*>(memchr(b, '[', e - b));
-    enforce(p, "unmatched ']'");
+    p = static_cast<const char*>(memchr(b, '[', size_t(e - b)));
+    enforce(p != nullptr, "unmatched ']'");
   } else {
-    p = static_cast<const char*>(memchr(b, '.', e - b));
+    p = static_cast<const char*>(memchr(b, '.', size_t(e - b)));
   }
   if (p) {
     key_.assign(p + 1, e);
@@ -231,7 +258,7 @@ inline StringPiece FormatArg::doSplitKey() {
     p = e;
     key_.clear();
   }
-  if (!emptyOk) {  // static
+  if (!emptyOk) { // static
     enforce(b != p, "non-empty key required");
   }
   return StringPiece(b, p);
@@ -242,15 +269,9 @@ inline int FormatArg::splitIntKey() {
     nextKeyMode_ = NextKeyMode::NONE;
     return nextIntKey_;
   }
-  try {
-    return to<int>(doSplitKey<true>());
-  } catch (const std::out_of_range& e) {
-    error("integer key required");
-    return 0;  // unreached
-  }
+  auto result = tryTo<int>(doSplitKey<true>());
+  enforce(result, "integer key required");
+  return *result;
 }
 
-}  // namespace folly
-
-#endif /* FOLLY_FORMATARG_H_ */
-
+} // namespace folly

@@ -1,5 +1,5 @@
 /*
- * Copyright 2013 Facebook, Inc.
+ * Copyright 2012-present Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,15 +14,18 @@
  * limitations under the License.
  */
 
-#include "folly/experimental/EventCount.h"
+#include <folly/experimental/EventCount.h>
 
 #include <algorithm>
+#include <atomic>
 #include <random>
-#include <glog/logging.h>
-#include <gtest/gtest.h>
+#include <thread>
+#include <vector>
 
-#include "folly/Random.h"
-#include "folly/Benchmark.h"
+#include <glog/logging.h>
+
+#include <folly/Random.h>
+#include <folly/portability/GTest.h>
 
 using namespace folly;
 
@@ -30,7 +33,7 @@ namespace {
 
 class Semaphore {
  public:
-  explicit Semaphore(int v=0) : value_(v) { }
+  explicit Semaphore(int v = 0) : value_(v) {}
 
   void down() {
     ec_.await([this] { return tryDown(); });
@@ -47,15 +50,12 @@ class Semaphore {
 
  private:
   bool tryDown() {
-    for (;;) {
-      int v = value_;
-      if (v == 0) {
-        return false;
-      }
-      if (value_.compare_exchange_weak(v, v-1)) {
+    for (int v = value_; v != 0;) {
+      if (value_.compare_exchange_weak(v, v - 1)) {
         return true;
       }
     }
+    return false;
   }
 
   std::atomic<int> value_;
@@ -63,18 +63,21 @@ class Semaphore {
 };
 
 template <class T, class Random>
-void randomPartition(Random& random, T key, int n,
-                     std::vector<std::pair<T, int>>& out) {
+void randomPartition(
+    Random& random,
+    T key,
+    int n,
+    std::vector<std::pair<T, int>>& out) {
   while (n != 0) {
     int m = std::min(n, 1000);
     std::uniform_int_distribution<uint32_t> u(1, m);
     int cut = u(random);
-    out.push_back(std::make_pair(key, cut));
+    out.emplace_back(key, cut);
     n -= cut;
   }
 }
 
-}  // namespace
+} // namespace
 
 TEST(EventCount, Simple) {
   // We're basically testing for no deadlock.
@@ -82,7 +85,7 @@ TEST(EventCount, Simple) {
 
   enum class Op {
     UP,
-    DOWN
+    DOWN,
   };
   std::vector<std::pair<Op, int>> ops;
   std::mt19937 rnd(randomNumberSeed());
@@ -93,7 +96,7 @@ TEST(EventCount, Simple) {
   VLOG(1) << "Using " << ops.size() << " threads: uppers=" << uppers
           << " downers=" << downers << " sem_count=" << count;
 
-  std::random_shuffle(ops.begin(), ops.end());
+  std::shuffle(ops.begin(), ops.end(), std::mt19937(std::random_device()()));
 
   std::vector<std::thread> threads;
   threads.reserve(ops.size());
@@ -102,14 +105,14 @@ TEST(EventCount, Simple) {
   for (auto& op : ops) {
     int n = op.second;
     if (op.first == Op::UP) {
-      auto fn = [&sem, n] () mutable {
+      auto fn = [&sem, n]() mutable {
         while (n--) {
           sem.up();
         }
       };
       threads.push_back(std::thread(fn));
     } else {
-      auto fn = [&sem, n] () mutable {
+      auto fn = [&sem, n]() mutable {
         while (n--) {
           sem.down();
         }
@@ -124,14 +127,3 @@ TEST(EventCount, Simple) {
 
   EXPECT_EQ(0, sem.value());
 }
-
-int main(int argc, char *argv[]) {
-  testing::InitGoogleTest(&argc, argv);
-  google::ParseCommandLineFlags(&argc, &argv, true);
-  auto ret = RUN_ALL_TESTS();
-  if (!ret) {
-    folly::runBenchmarksOnFlag();
-  }
-  return ret;
-}
-
